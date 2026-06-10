@@ -1,60 +1,92 @@
 # rp_pico_2_w
 
+## folder sturecture 
+
+```
+henrik@henrik-Latitude-5490:~/repo$ ls
+pico-examples  pico-sdk  picotool  README.md
+```
+
+### set enviroment 
+```
+export PICO_SDK_PATH=~/repo/pico-sdk"
+export PICOTOOL_FETCH_FROM_GIT_PATH=~/repo/picotool
+export PICO_BOARD=pico2_w
+
+```
+Or pass as argument to cmake  
+```
+cmake -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk ..
+```
 
 
-mkdir ~/code/pico
+### Get pico-sdk 
 
-cd ~/code/pico
+The pico-sdk contains submodules, nested repositories. 
 
+```
 git clone https://github.com/raspberrypi/pico-sdk.git --branch master
-
 cd pico-sdk
-
 git submodule update --init
-
-cd ..
-
-git clone https://github.com/raspberrypi/pico-examples.git --branch master
-
-cd pico-examples
-
+```
+### Get picotools
+```
+git clone https://github.com/raspberrypi/picotool.git
+```
+You need libusb: `sudo apt install libusb-1.0-0-dev`
+```
 mkdir build
-
 cd build
+```
+Make sure that environment variables `PICO_SDK_PATH` is set 
+```
+cmake ..
+make
+```
+This will generate a picotool command-line binary in the build/picotool directory.
 
-export PICO_SDK_PATH=~/code/pico/pico-sdk
 
-cmake -DPICO_BOARD=pico2_w  ..
+### Get pico-examples 
+
+```
+git clone https://github.com/raspberrypi/pico-examples.git --branch master
+cd pico-examples
+mkdir build
+cd build
+```
+Make sure that environment variables `PICO_BOARD` is set 
+```
+cmake ..
+```
 
 
-Pico project: /home/henrik/code/pico_proj1
+### setup project 
 
 In project folder 
 
-git clone https://github.com/raspberrypi/pico-sdk.git
+- Copy external/pico_sdk_import.cmake from the SDK into your project directory
 
-Copy external/pico_sdk_import.cmake from the SDK into your project directory
+### wifi setup variables 
 
-export PICO_SDK_PATH=~/code/pico_proj1/pico-sdk
-
-alt: -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk
-
-pwd:/home/henrik/code/pico_proj1
-
-cp  pico-sdk/external/pico_sdk_import.cmake .
-
-mkdir build
-
-cd build
-
-cmake -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk ..
-
-
+```
 -DWIFI_SSID="Telia-9F1ED6"
-
 -DWIFI_PASSWORD="aTuptyeMvx89neCd"
 
 cmake -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk -DWIFI_SSID="Telia-9F1ED6" -DWIFI_PASSWORD="aTuptyeMvx89neCd" ..
-
-
+```     
+### terminal setting, URART mode 
+```
 minicom -b 115200 -o -D /dev/ttyACM0
+```
+
+### Install Toolchain 
+
+```
+$ sudo apt update
+
+$ sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
+```
+Ubuntu and Debian users might additionally need to do:
+```
+$ apt install g++ libstdc++-arm-none-eabi-newlib
+```
