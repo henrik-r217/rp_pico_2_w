@@ -1,60 +1,102 @@
-# README in buld folder. 
-
-Add information about how to build the project.
+# README in pico_proj1 
 
 
-export PICO_SDK_PATH=~/code/rp_pico_2w/pico_proj1/pico-sdk
+## Folder stucture 
 
-#Fixa
+```
+henrik@henrik-Latitude-5490:~/repo$ ls
+pico-examples  pico-sdk  picotool  README.md rp_pico_2_w
+```
+## Project repository in folder rp_pico_2_w
+```
+git clone git@github.com:henrik-r217/rp_pico_2_w.git
+``` 
 
-export PICOTOOL_FETCH_FROM_GIT_PATH=~/code/rp_pico_2w/xxxxx/pico_proj1/pico-sdk
+
+### set enviroment 
+```
+export PICO_SDK_PATH=~/repo/pico-sdk"
+export PICOTOOL_FETCH_FROM_GIT_PATH=~/repo/picotool
+export PICO_BOARD=pico2_w
+
+```
+Or pass as argument to cmake  
+```
+cmake -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk ..
+```
 
 
-cmake -DPICO_BOARD=pico2_w ..
+### Get pico-sdk 
 
+The pico-sdk contains submodules, nested repositories. 
 
-
-
-CMake Warning at pico-sdk/tools/Findpicotool.cmake:30 (message):
-  No installed picotool with version 2.1.1 found - building from source
-
-  It is recommended to build and install picotool separately, or to set
-  PICOTOOL_FETCH_FROM_GIT_PATH to a common directory for all your SDK
-  projects
-
-Get picotools:
-
+```
+git clone https://github.com/raspberrypi/pico-sdk.git --branch master
+cd pico-sdk
+git submodule update --init
+```
+### Get picotools
+```
 git clone https://github.com/raspberrypi/picotool.git
+```
+You need libusb: `sudo apt install libusb-1.0-0-dev`
+```
+mkdir build
+cd build
+```
+Make sure that environment variables `PICO_SDK_PATH` is set 
+```
+cmake ..
+make
+```
+This will generate a picotool command-line binary in the build/picotool directory.
 
-You need libusb:
-sudo apt install libusb-1.0-0-dev
+```
+sudo ~/repo/picotool/build/picotool info -a
+```
 
-Building picotool:
+### Get pico-examples 
 
-$ mkdir build
-$ cd build
-$ export PICO_SDK_PATH=~/pico/pico-sdk
-$ cmake ../
-$ make
-this will generate a picotool command-line binary in the build/picotool directory.
-
-
-Pico-sdk and pico-examples:
-
-$ cd ~/pico
-$ git clone https://github.com/raspberrypi/pico-sdk.git --branch master
-$ cd pico-sdk
-$ git submodule update --init
-$ cd ..
-$ git clone https://github.com/raspberrypi/pico-examples.git --branch master
+```
+git clone https://github.com/raspberrypi/pico-examples.git --branch master
+cd pico-examples
+mkdir build
+cd build
+```
+Make sure that environment variables `PICO_BOARD` is set 
+```
+cmake ..
+```
 
 
-Install Toolchain
+### setup project 
 
+In project folder 
+
+- Copy external/pico_sdk_import.cmake from the SDK into your project directory
+
+### wifi setup variables 
+
+```
+-DWIFI_SSID="Telia-9F1ED6"
+-DWIFI_PASSWORD="aTuptyeMvx89neCd"
+
+cmake -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk -DWIFI_SSID="Telia-9F1ED6" -DWIFI_PASSWORD="aTuptyeMvx89neCd" ..
+```     
+### terminal setting, USB mode 
+```
+sudo minicom -b 115200 -o -D /dev/ttyACM0
+```
+To quit `ctrl+a`,`z` then `x`
+
+### Install Toolchain 
+
+```
 $ sudo apt update
 
 $ sudo apt install cmake gcc-arm-none-eabi libnewlib-arm-none-eabi build-essential
-
+```
 Ubuntu and Debian users might additionally need to do:
-
+```
 $ apt install g++ libstdc++-arm-none-eabi-newlib
+```
