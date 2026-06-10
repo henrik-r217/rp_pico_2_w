@@ -45,6 +45,9 @@ make
 ```
 This will generate a picotool command-line binary in the build/picotool directory.
 
+```
+sudo ~/repo/picotool/build/picotool info -a
+```
 
 ### Get pico-examples 
 
@@ -74,10 +77,11 @@ In project folder
 
 cmake -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code/pico_proj1/pico-sdk -DWIFI_SSID="Telia-9F1ED6" -DWIFI_PASSWORD="aTuptyeMvx89neCd" ..
 ```     
-### terminal setting, URART mode 
+### terminal setting, USB mode 
 ```
-minicom -b 115200 -o -D /dev/ttyACM0
+sudo minicom -b 115200 -o -D /dev/ttyACM0
 ```
+To quit `ctrl+a`,`z` then `x`
 
 ### Install Toolchain 
 
