@@ -10,7 +10,7 @@ project(my_project)
 pico_sdk_init()
 
 # Include pico-sensor-lib library.
-add_subdirectory(pico-sdk/lib/pico-sensor-lib)
+add_subdirectory(libs/pico-sensor-lib)
 
 
 # rest of your project

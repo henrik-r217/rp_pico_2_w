@@ -73,8 +73,32 @@ cmake ..
 
 In project folder 
 
-- Copy external/pico_sdk_import.cmake from the SDK into your project directory
+- Copy `external/pico_sdk_import.cmake` from the SDK into your project directory
 
+## Including pico-sensor-lib in a project
+
+https://github.com/tjko/pico-sensor-lib
+
+First, get the library (this example adds it as a submodule to existing repository):
+
+```
+$ mkdir libs
+$ cd libs
+$ git submodule add https://github.com/tjko/pico-sensor-lib.git
+```
+
+Then to use this library, include it in your CMakeLists.txt file:
+```
+# Include pico-sensor-lib library.
+add_subdirectory(libs/pico-sensor-lib)
+```
+Also add pico_sensor_lib in target_link_libraries statement:
+```
+target_link_libraries(myprogram PRIVATE
+  ...
+  pico_sensor_lib
+  )
+```
 ### wifi setup variables 
 
 ```
