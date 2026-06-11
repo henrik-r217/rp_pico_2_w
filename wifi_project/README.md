@@ -47,11 +47,11 @@ pico_http_post/
 ├── lwipopts.h
 └── main.c
 ```
-
----
-
 ## File: `main.c`
 
+<details>
+<summary>File: main.c</summary>
+   
 ```c
 #include <stdio.h>
 #include <string.h>
@@ -394,10 +394,14 @@ int main() {
     return client.success ? 0 : 1;
 }
 ```
-
+</details>
+   
 ---
 
 ## File: `CMakeLists.txt`
+
+<details>
+<summary>File: CMakeLists.txt</summary>
 
 ```cmake
 cmake_minimum_required(VERSION 3.13)
@@ -436,10 +440,15 @@ pico_enable_stdio_uart(pico_http_post 0)
 pico_add_extra_outputs(pico_http_post)
 ```
 
+</details>
+
 ---
 
 ## File: `lwipopts.h`
 
+<details>
+<summary>File: lwipopts.h</summary>
+   
 ```c
 #ifndef LWIPOPTS_H
 #define LWIPOPTS_H
@@ -478,6 +487,8 @@ pico_add_extra_outputs(pico_http_post)
 
 #endif
 ```
+
+</details>
 
 ---
 
@@ -545,6 +556,9 @@ endpoint_server/
 
 ## File: `endpoint_server.c`
 
+<details>
+<summary>File: endpoint_server.c</summary>
+   
 ```c
 #define _GNU_SOURCE
 
@@ -1004,6 +1018,8 @@ int main(void) {
     return 0;
 }
 ```
+
+</details>
 
 ---
 
