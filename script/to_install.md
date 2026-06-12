@@ -32,7 +32,7 @@ ssh -T git@github.com
 ```
 
 
-create file: .gitignore
+## Create file: .gitignore
 ```
 # Ignore everything in this directory
 *
