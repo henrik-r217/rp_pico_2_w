@@ -14,6 +14,7 @@ int main() {
     int res;
     // Initialize sensor
     void *ctx = NULL;
+    stdio_init_all();
     sleep_ms(2000);
     setup_default_uart();
     sleep_ms(5000);
