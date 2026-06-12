@@ -44,6 +44,7 @@ mkdir build;
 cd build;
 cmake ..
 make
+ln -s $(pwd)/picotool /usr/local/bin/picotool;
 cd ../../
 
 git clone https://github.com/raspberrypi/pico-examples.git --branch master
