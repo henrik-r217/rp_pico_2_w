@@ -2,9 +2,12 @@
 
 ## folder sturecture 
 
-```
-henrik@henrik-Latitude-5490:~/repo$ ls
-pico-examples  pico-sdk  picotool  README.md
+```text
+~/repo/
+├──pico-examples
+├──pico-sdk
+├──picotool
+└──README.md
 ```
 
 ### set enviroment 
