@@ -55,7 +55,7 @@ git clone https://github.com/raspberrypi/pico-examples.git --branch master
 
 export PICO_BOARD=pico2_w
 
-git clone https://github.com/henrik-r217/rp_pico_2_w.git --branch main
+git clone git@github.com:henrik-r217/rp_pico_2_w.git --branch main
 cd rp_pico_2_w
 git submodule update --init
 cd ../..
