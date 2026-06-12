@@ -72,7 +72,7 @@ cmake ..
 
 In project folder 
 
-- Copy `external/pico_sdk_import.cmake` from the SDK into your project directory
+Copy `external/pico_sdk_import.cmake` from the SDK into your project directory
 
 ### wifi setup variables 
 
