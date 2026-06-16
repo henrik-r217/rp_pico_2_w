@@ -30,8 +30,12 @@ cat ~/.ssh/id_ed25519.pub
 ```
 ssh -T git@github.com
 ```
+## Set git config 
+```
 git config --global user.name "Henrik"
 git config --global user.email henrik@lindenet.se
+```
+
 
 ## Create file: .gitignore
 ```
