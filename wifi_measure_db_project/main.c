@@ -16,12 +16,15 @@
 #include "lwip/pbuf.h"
 #include "sht30.h"
 
+// add debug prints
 #define DEBUG
 
 #ifdef DEBUG
 #define DEBUG_print printf
 #else
 #define DEBUG_print // macros
+
+
 #endif
 
 #ifndef WIFI_SSID
@@ -198,7 +201,7 @@ static void queue_push(const measurement_t *m) {
         queue_head = (queue_head + 1u) % MEASUREMENT_QUEUE_CAPACITY;
         queue_count--;
         dropped_measurements++;
-        printf("Queue full -> dropped oldest measurement (total dropped=%lu)\n",
+        DEBUG_print("Queue full -> dropped oldest measurement (total dropped=%lu)\n",
                (unsigned long)dropped_measurements);
     }
 
@@ -221,7 +224,7 @@ static bool ensure_wifi_connected(void) {
         return true;
     }
 
-    printf("Wi-Fi is down, trying to connect...\n");
+    DEBUG_print("Wi-Fi is down, trying to connect...\n");
     cyw43_arch_enable_sta_mode();
 
     int result = cyw43_arch_wifi_connect_timeout_ms(
@@ -232,11 +235,11 @@ static bool ensure_wifi_connected(void) {
     );
 
     if (result != 0) {
-        printf("Wi-Fi connect failed: %d\n", result);
+        DEBUG_print("Wi-Fi connect failed: %d\n", result);
         return false;
     }
 
-    printf("Wi-Fi connected\n");
+    DEBUG_print("Wi-Fi connected\n");
     return true;
 }
 
@@ -263,18 +266,18 @@ static void ntp_mark_synced(uint32_t epoch_utc) {
     g_ntp.time_valid = true;
     g_ntp.request_in_flight = false;
     g_ntp.next_sync_ms = now_ms() + NTP_REFRESH_INTERVAL_MS;
-    printf("NTP synced: epoch=%lu\n", (unsigned long)epoch_utc);
+    DEBUG_print("NTP synced: epoch=%lu\n", (unsigned long)epoch_utc);
 }
 
 static void ntp_send_request(void) {
     if (g_ntp.udp_pcb == NULL) {
-        printf("NTP: no UDP PCB\n");
+        DEBUG_print("NTP: no UDP PCB\n");
         return;
     }
 
     struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
     if (!p) {
-        printf("NTP: pbuf_alloc failed\n");
+        DEBUG_print("NTP: pbuf_alloc failed\n");
         return;
     }
 
@@ -289,13 +292,13 @@ static void ntp_send_request(void) {
     pbuf_free(p);
 
     if (err != ERR_OK) {
-        printf("NTP: udp_sendto failed: %d\n", err);
+        DEBUG_print("NTP: udp_sendto failed: %d\n", err);
         return;
     }
 
     g_ntp.request_in_flight = true;
     g_ntp.request_deadline_ms = now_ms() + NTP_RESEND_MS;
-    printf("NTP: request sent\n");
+    DEBUG_print("NTP: request sent\n");
 }
 
 static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
@@ -324,7 +327,7 @@ static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
             uint32_t epoch_utc = seconds_since_1900 - NTP_DELTA;
             ntp_mark_synced(epoch_utc);
         } else {
-            printf("NTP: invalid reply (mode=%u stratum=%u)\n", mode, stratum);
+            DEBUG_print("NTP: invalid reply (mode=%u stratum=%u)\n", mode, stratum);
             g_ntp.request_in_flight = false;
             g_ntp.next_sync_ms = now_ms() + NTP_RESEND_MS;
         }
@@ -340,13 +343,13 @@ static void ntp_dns_found_cb(const char *hostname, const ip_addr_t *ipaddr, void
     g_ntp.dns_in_progress = false;
 
     if (!ipaddr) {
-        printf("NTP: DNS lookup failed\n");
+        DEBUG_print("NTP: DNS lookup failed\n");
         g_ntp.next_sync_ms = now_ms() + NTP_RESEND_MS;
         return;
     }
 
     g_ntp.server_addr = *ipaddr;
-    printf("NTP: server %s\n", ipaddr_ntoa(ipaddr));
+    DEBUG_print("NTP: server %s\n", ipaddr_ntoa(ipaddr));
     ntp_send_request();
 }
 
@@ -361,7 +364,7 @@ static void ntp_init_module(void) {
     cyw43_arch_lwip_end();
 
     if (!g_ntp.udp_pcb) {
-        printf("NTP: failed to create UDP PCB\n");
+        DEBUG_print("NTP: failed to create UDP PCB\n");
         return;
     }
 
@@ -373,7 +376,7 @@ static void ntp_start_sync(void) {
         return;
     }
 
-    printf("NTP: resolving %s\n", NTP_SERVER);
+    DEBUG_print("NTP: resolving %s\n", NTP_SERVER);
 
     cyw43_arch_lwip_begin();
     ip_addr_t tmp_addr;
@@ -382,12 +385,12 @@ static void ntp_start_sync(void) {
 
     if (err == ERR_OK) {
         g_ntp.server_addr = tmp_addr;
-        printf("NTP: DNS cached -> %s\n", ipaddr_ntoa(&tmp_addr));
+        DEBUG_print("NTP: DNS cached -> %s\n", ipaddr_ntoa(&tmp_addr));
         ntp_send_request();
     } else if (err == ERR_INPROGRESS) {
         g_ntp.dns_in_progress = true;
     } else {
-        printf("NTP: dns_gethostbyname failed: %d\n", err);
+        DEBUG_print("NTP: dns_gethostbyname failed: %d\n", err);
         g_ntp.next_sync_ms = now_ms() + NTP_RESEND_MS;
     }
 }
@@ -400,7 +403,7 @@ static void ntp_poll(void) {
     uint64_t ms = now_ms();
 
     if (g_ntp.request_in_flight && ms >= g_ntp.request_deadline_ms) {
-        printf("NTP: request timeout, retry later\n");
+        DEBUG_print("NTP: request timeout, retry later\n");
         g_ntp.request_in_flight = false;
         g_ntp.next_sync_ms = ms + NTP_RESEND_MS;
     }
@@ -437,11 +440,11 @@ static measurement_t create_measurement(void) {
 
     status = sht30_read(&sensor, &temperature_c, &humidity_rh);
     if (status == SHT30_OK) {
-      printf("Temperature: %.2f C, Humidity: %.2f %%RH\n",
+      DEBUG_print("Temperature: %.2f C, Humidity: %.2f %%RH\n",
              temperature_c,
              humidity_rh);
     } else {
-      printf("sht30_read failed: %s\n", sht30_strerror(status));
+      DEBUG_print("sht30_read failed: %s\n", sht30_strerror(status));
     }
     
     /* TODO: Replace with real sensor reads */
@@ -504,7 +507,7 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
             (unsigned long)queue_size(),
             (unsigned long)dropped_measurements,
             ntp_time_is_valid() ? "true" : "false")) {
-        printf("build_batch_payload: failed to write JSON header (used=%lu size=%lu)\n",
+        DEBUG_print("build_batch_payload: failed to write JSON header (used=%lu size=%lu)\n",
                (unsigned long)used,
                (unsigned long)out_size);
         return false;
@@ -543,14 +546,14 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
         );
 
         if (item_len <= 0 || item_len >= (int)sizeof(item_buf)) {
-            printf("build_batch_payload: measurement format failed for seq=%lu\n",
+            DEBUG_print("build_batch_payload: measurement format failed for seq=%lu\n",
                    (unsigned long)m->seq);
             break;
         }
 
         size_t reserve_tail = 3; /* ]} + nul */
         if (used + (size_t)item_len + reserve_tail >= out_size) {
-            printf("build_batch_payload: stopping at count=%lu, next seq=%lu would exceed buffer (used=%lu size=%lu)\n",
+            DEBUG_print("build_batch_payload: stopping at count=%lu, next seq=%lu would exceed buffer (used=%lu size=%lu)\n",
                    (unsigned long)count,
                    (unsigned long)m->seq,
                    (unsigned long)used,
@@ -565,13 +568,13 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
     }
 
     if (count == 0u) {
-        printf("build_batch_payload: no measurement fits in payload buffer (size=%lu)\n",
+        DEBUG_print("build_batch_payload: no measurement fits in payload buffer (size=%lu)\n",
                (unsigned long)out_size);
         return false;
     }
 
     if (!append_to_buffer(out, out_size, &used, "]}")) {
-        printf("build_batch_payload: failed to append JSON trailer (used=%lu size=%lu count=%lu)\n",
+        DEBUG_print("build_batch_payload: failed to append JSON trailer (used=%lu size=%lu count=%lu)\n",
                (unsigned long)used,
                (unsigned long)out_size,
                (unsigned long)count);
@@ -580,7 +583,7 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
 
     *batched_count = count;
 
-    printf("build_batch_payload: built batch with %lu measurements, payload_bytes=%lu\n",
+    DEBUG_print("build_batch_payload: built batch with %lu measurements, payload_bytes=%lu\n",
            (unsigned long)count,
            (unsigned long)used);
 
@@ -635,7 +638,7 @@ static void parse_http_status(http_client_t *client) {
     if (sscanf(client->response_head, "HTTP/%*s %d", &status) == 1) {
         client->http_status = status;
         client->got_http_status = true;
-        printf("Parsed HTTP status: %d\n", status);
+        DEBUG_print("Parsed HTTP status: %d\n", status);
     }
 }
 
@@ -661,7 +664,7 @@ static void append_response_head(http_client_t *client, const void *data, size_t
 
 static void http_err_cb(void *arg, err_t err) {
     http_client_t *client = (http_client_t *)arg;
-    printf("HTTP TCP error: %d\n", err);
+    DEBUG_print("HTTP TCP error: %d\n", err);
 
     if (client != NULL) {
         client->pcb = NULL;
@@ -704,7 +707,7 @@ static err_t http_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t 
         fwrite(q->payload, 1, q->len, stdout);
         q = q->next;
     }
-    printf("\n");
+    DEBUG_print("\n");
 
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
@@ -714,7 +717,7 @@ static err_t http_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t 
 static err_t http_sent_cb(void *arg, struct tcp_pcb *pcb, u16_t len) {
     (void)arg;
     (void)pcb;
-    printf("HTTP sent %u bytes\n", len);
+    DEBUG_print("HTTP sent %u bytes\n", len);
     return ERR_OK;
 }
 
@@ -726,7 +729,7 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     }
 
     if (err != ERR_OK) {
-        printf("tcp_connect callback error: %d\n", err);
+        DEBUG_print("tcp_connect callback error: %d\n", err);
         client->complete = true;
         client->success = false;
         return err;
@@ -753,7 +756,7 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     );
 
     if (request_len <= 0 || request_len >= (int)sizeof(request)) {
-        printf("HTTP request too large\n");
+        DEBUG_print("HTTP request too large\n");
         client->complete = true;
         client->success = false;
         return ERR_BUF;
@@ -761,7 +764,7 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
 
     err_t werr = tcp_write(pcb, request, (u16_t)request_len, TCP_WRITE_FLAG_COPY);
     if (werr != ERR_OK) {
-        printf("tcp_write failed: %d\n", werr);
+        DEBUG_print("tcp_write failed: %d\n", werr);
         client->complete = true;
         client->success = false;
         return werr;
@@ -769,13 +772,13 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
 
     err_t oerr = tcp_output(pcb);
     if (oerr != ERR_OK) {
-        printf("tcp_output failed: %d\n", oerr);
+        DEBUG_print("tcp_output failed: %d\n", oerr);
         client->complete = true;
         client->success = false;
         return oerr;
     }
 
-    printf("HTTP POST sent, payload_bytes=%u\n", (unsigned)strlen(client->payload));
+    DEBUG_print("HTTP POST sent, payload_bytes=%u\n", (unsigned)strlen(client->payload));
     return ERR_OK;
 }
 
@@ -787,21 +790,21 @@ static void http_dns_found_cb(const char *hostname, const ip_addr_t *ipaddr, voi
     }
 
     if (ipaddr == NULL) {
-        printf("HTTP DNS lookup failed for %s\n", hostname);
+        DEBUG_print("HTTP DNS lookup failed for %s\n", hostname);
         client->complete = true;
         client->success = false;
         return;
     }
 
     client->remote_addr = *ipaddr;
-    printf("HTTP DNS resolved %s -> %s\n", hostname, ipaddr_ntoa(ipaddr));
+    DEBUG_print("HTTP DNS resolved %s -> %s\n", hostname, ipaddr_ntoa(ipaddr));
 
     cyw43_arch_lwip_begin();
     err_t err = tcp_connect(client->pcb, &client->remote_addr, SERVER_PORT, http_connected_cb);
     cyw43_arch_lwip_end();
 
     if (err != ERR_OK) {
-        printf("tcp_connect failed after DNS: %d\n", err);
+        DEBUG_print("tcp_connect failed after DNS: %d\n", err);
         client->complete = true;
         client->success = false;
         http_client_abort(client);
@@ -815,7 +818,7 @@ static void start_http_post(http_client_t *client, const char *payload) {
 
     client->pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
     if (client->pcb == NULL) {
-        printf("tcp_new_ip_type failed\n");
+        DEBUG_print("tcp_new_ip_type failed\n");
         client->complete = true;
         client->success = false;
         return;
@@ -834,7 +837,7 @@ static void start_http_post(http_client_t *client, const char *payload) {
         cyw43_arch_lwip_end();
 
         if (err != ERR_OK) {
-            printf("tcp_connect failed immediately: %d\n", err);
+            DEBUG_print("tcp_connect failed immediately: %d\n", err);
             client->complete = true;
             client->success = false;
             http_client_abort(client);
@@ -852,7 +855,7 @@ static void start_http_post(http_client_t *client, const char *payload) {
         err = tcp_connect(client->pcb, &client->remote_addr, SERVER_PORT, http_connected_cb);
         cyw43_arch_lwip_end();
         if (err != ERR_OK) {
-            printf("tcp_connect failed after cached DNS: %d\n", err);
+            DEBUG_print("tcp_connect failed after cached DNS: %d\n", err);
             client->complete = true;
             client->success = false;
             http_client_abort(client);
@@ -860,7 +863,7 @@ static void start_http_post(http_client_t *client, const char *payload) {
     } else if (err == ERR_INPROGRESS) {
         /* Wait for DNS callback */
     } else {
-        printf("dns_gethostbyname failed: %d\n", err);
+        DEBUG_print("dns_gethostbyname failed: %d\n", err);
         client->complete = true;
         client->success = false;
         http_client_abort(client);
@@ -876,7 +879,7 @@ static bool wait_for_http_completion(http_client_t *client, uint32_t timeout_ms)
     }
 
     if (!client->complete) {
-        printf("HTTP timeout after %lu ms\n", (unsigned long)timeout_ms);
+        DEBUG_print("HTTP timeout after %lu ms\n", (unsigned long)timeout_ms);
         http_client_abort(client);
         client->complete = true;
         client->success = false;
@@ -894,12 +897,12 @@ static bool send_one_batch(size_t *sent_count) {
     *sent_count = 0;
 
     if (queue_is_empty()) {
-        printf("send_one_batch: queue is empty\n");
+        DEBUG_print("send_one_batch: queue is empty\n");
         return true;
     }
 
     if (!ensure_wifi_connected()) {
-        printf("send_one_batch: cannot send, Wi-Fi unavailable\n");
+        DEBUG_print("send_one_batch: cannot send, Wi-Fi unavailable\n");
         return false;
     }
 
@@ -907,7 +910,7 @@ static bool send_one_batch(size_t *sent_count) {
     size_t batch_count = 0;
 
     if (!build_batch_payload(payload, sizeof(payload), &batch_count)) {
-        printf("send_one_batch: failed to build batch payload (queue=%lu, buffer=%u, max_batch=%u)\n",
+        DEBUG_print("send_one_batch: failed to build batch payload (queue=%lu, buffer=%u, max_batch=%u)\n",
                (unsigned long)queue_size(),
                (unsigned)PAYLOAD_BUFFER_SIZE,
                (unsigned)MAX_BATCH_SIZE);
@@ -915,11 +918,11 @@ static bool send_one_batch(size_t *sent_count) {
     }
 
     if (batch_count == 0) {
-        printf("send_one_batch: batch_count == 0\n");
+        DEBUG_print("send_one_batch: batch_count == 0\n");
         return false;
     }
 
-    printf("send_one_batch: prepared batch with %lu measurements (queue depth before send=%lu)\n",
+    DEBUG_print("send_one_batch: prepared batch with %lu measurements (queue depth before send=%lu)\n",
            (unsigned long)batch_count,
            (unsigned long)queue_size());
 
@@ -928,17 +931,17 @@ static bool send_one_batch(size_t *sent_count) {
     bool ok = wait_for_http_completion(&client, HTTP_TIMEOUT_MS);
 
     if (ok) {
-        printf("send_one_batch: POST OK -> removing %lu measurements from queue\n",
+        DEBUG_print("send_one_batch: POST OK -> removing %lu measurements from queue\n",
                (unsigned long)batch_count);
         queue_pop_n(batch_count);
         *sent_count = batch_count;
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-        printf("send_one_batch: queue depth after send=%lu\n",
+        DEBUG_print("send_one_batch: queue depth after send=%lu\n",
                (unsigned long)queue_size());
         return true;
     }
 
-    printf("send_one_batch: POST failed -> keeping %lu measurements in queue\n",
+    DEBUG_print("send_one_batch: POST failed -> keeping %lu measurements in queue\n",
            (unsigned long)batch_count);
     cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
     return false;
@@ -949,12 +952,12 @@ static void try_send_buffered_measurements(void) {
     size_t total_sent_this_cycle = 0;
 
     if (initial_queue == 0) {
-        printf("try_send_buffered_measurements: queue empty\n");
+        DEBUG_print("try_send_buffered_measurements: queue empty\n");
         return;
     }
 
     if (!wifi_is_connected()) {
-        printf("try_send_buffered_measurements: Wi-Fi down, skipping send (queued=%lu dropped_total=%lu)\n",
+        DEBUG_print("try_send_buffered_measurements: Wi-Fi down, skipping send (queued=%lu dropped_total=%lu)\n",
                (unsigned long)queue_size(),
                (unsigned long)dropped_measurements);
         return;
@@ -974,13 +977,13 @@ static void try_send_buffered_measurements(void) {
         allowed_batch_attempts = MAX_BATCH_REQUESTS_PER_CYCLE;
     }
 
-    printf("try_send_buffered_measurements: start (queued=%lu, allowed_batch_attempts=%lu)\n",
+    DEBUG_print("try_send_buffered_measurements: start (queued=%lu, allowed_batch_attempts=%lu)\n",
            (unsigned long)initial_queue,
            (unsigned long)allowed_batch_attempts);
 
     for (size_t batch_no = 0; batch_no < allowed_batch_attempts; batch_no++) {
         if (queue_is_empty()) {
-            printf("try_send_buffered_measurements: queue drained early after %lu batch attempts\n",
+            DEBUG_print("try_send_buffered_measurements: queue drained early after %lu batch attempts\n",
                    (unsigned long)batch_no);
             break;
         }
@@ -990,34 +993,34 @@ static void try_send_buffered_measurements(void) {
         bool ok = send_one_batch(&sent_count);
 
         if (!ok) {
-            printf("try_send_buffered_measurements: batch attempt %lu failed (queued=%lu)\n",
+            DEBUG_print("try_send_buffered_measurements: batch attempt %lu failed (queued=%lu)\n",
                    (unsigned long)(batch_no + 1u),
                    (unsigned long)queue_size());
             break;
         }
 
         if (sent_count == 0u) {
-            printf("try_send_buffered_measurements: batch attempt %lu sent 0 items (stopping)\n",
+            DEBUG_print("try_send_buffered_measurements: batch attempt %lu sent 0 items (stopping)\n",
                    (unsigned long)(batch_no + 1u));
             break;
         }
 
         total_sent_this_cycle += sent_count;
 
-        printf("try_send_buffered_measurements: batch attempt %lu OK (sent=%lu, queue_before=%lu, queue_after=%lu)\n",
+        DEBUG_print("try_send_buffered_measurements: batch attempt %lu OK (sent=%lu, queue_before=%lu, queue_after=%lu)\n",
                (unsigned long)(batch_no + 1u),
                (unsigned long)sent_count,
                (unsigned long)before_send,
                (unsigned long)queue_size());
 
         if (queue_size() <= (MAX_BATCH_SIZE / 2u)) {
-            printf("try_send_buffered_measurements: queue now small (%lu), stopping early\n",
+            DEBUG_print("try_send_buffered_measurements: queue now small (%lu), stopping early\n",
                    (unsigned long)queue_size());
             break;
         }
     }
 
-    printf("Cycle result: sent=%lu, queued=%lu, dropped_total=%lu\n",
+    DEBUG_print("Cycle result: sent=%lu, queued=%lu, dropped_total=%lu\n",
            (unsigned long)total_sent_this_cycle,
            (unsigned long)queue_size(),
            (unsigned long)dropped_measurements);
@@ -1030,11 +1033,11 @@ static void try_send_buffered_measurements(void) {
 int main(void) {
     stdio_init_all();
     sleep_ms(2000);
-    printf("Pico buffered batch HTTP POST example with NTP starting...\n");
+    DEBUG_print("Pico buffered batch HTTP POST example with NTP starting...\n");
 
     
     if (cyw43_arch_init()) {
-        printf("cyw43_arch_init failed\n");
+        DEBUG_print("cyw43_arch_init failed\n");
         return 1;
     }
 
@@ -1056,7 +1059,7 @@ int main(void) {
                             SHT30_ADDR_AUTO);
 
     if (status != SHT30_OK) {
-        printf("sht30_init failed: %s\n", sht30_strerror(status));
+        DEBUG_print("sht30_init failed: %s\n", sht30_strerror(status));
 
         /*
          * Om init misslyckas stannar vi här så felet blir tydligt.
@@ -1066,7 +1069,7 @@ int main(void) {
         }
     }
 
-    printf("SHT30 initialized successfully at address 0x%02X\n", sensor.addr);
+    DEBUG_print("SHT30 initialized successfully at address 0x%02X\n", sensor.addr);
 
     
     while (true) {
@@ -1075,22 +1078,22 @@ int main(void) {
         ntp_poll();
         
 	if (!ntp_time_is_valid()) {
-	  printf("Waiting for initial NTP sync...\n");
+	  DEBUG_print("Waiting for initial NTP sync...\n");
 	  if (ntp_wait_for_initial_sync(NTP_STARTUP_WAIT_MS)) {
-	    printf("Initial NTP sync OK\n");
+	    DEBUG_print("Initial NTP sync OK\n");
       } else {
-	    printf("Initial NTP sync timeout, continuing with time_valid=false\n");
+	    DEBUG_print("Initial NTP sync timeout, continuing with time_valid=false\n");
                 }
 	}
       } else {
-        printf("Wi-Fi unavailable, will keep buffering measurements\n");
+        DEBUG_print("Wi-Fi unavailable, will keep buffering measurements\n");
         sleep_ms(RETRY_DELAY_MS);
       }
       
       measurement_t m = create_measurement();
       queue_push(&m);
       
-      printf("Queued measurement seq=%lu time_valid=%s timestamp_utc=%lu (queue depth=%lu)\n",
+      DEBUG_print("Queued measurement seq=%lu time_valid=%s timestamp_utc=%lu (queue depth=%lu)\n",
              (unsigned long)m.seq,
              m.time_valid ? "true" : "false",
              (unsigned long)m.timestamp_utc,
