@@ -14,6 +14,15 @@
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
 #include "lwip/pbuf.h"
+#include "sht30.h"
+
+#define DEBUG
+
+#ifdef DEBUG
+#define DEBUG_print printf
+#else
+#define DEBUG_print // macros
+#endif
 
 #ifndef WIFI_SSID
 #define WIFI_SSID "your-ssid"
@@ -53,6 +62,12 @@
 #define NTP_REFRESH_INTERVAL_MS    3600000u
 #define NTP_STARTUP_WAIT_MS           15000u
 
+#define APP_I2C_PORT     i2c0
+#define APP_I2C_SDA_PIN  4
+#define APP_I2C_SCL_PIN  5
+#define APP_I2C_BAUDRATE 100000
+
+
 typedef struct {
     uint32_t seq;
     uint32_t uptime_s;
@@ -60,7 +75,6 @@ typedef struct {
     bool time_valid;
     float temperature;
     float humidity;
-    float voltage;
 } measurement_t;
 
 typedef struct {
@@ -87,6 +101,8 @@ typedef struct {
     uint64_t request_deadline_ms;
 } ntp_state_t;
 
+static int status;
+static sht30_t sensor;
 static measurement_t measurement_queue[MEASUREMENT_QUEUE_CAPACITY];
 static size_t queue_head = 0;
 static size_t queue_tail = 0;
@@ -411,15 +427,26 @@ static bool ntp_wait_for_initial_sync(uint32_t timeout_ms) {
 
 static measurement_t create_measurement(void) {
     measurement_t m;
+    float temperature_c = 0.0f;
+    float humidity_rh   = 0.0f;
+
     m.seq = next_sequence_number++;
     m.uptime_s = (uint32_t)(now_ms() / 1000u);
     m.timestamp_utc = ntp_now_utc();
     m.time_valid = ntp_time_is_valid();
 
+    status = sht30_read(&sensor, &temperature_c, &humidity_rh);
+    if (status == SHT30_OK) {
+      printf("Temperature: %.2f C, Humidity: %.2f %%RH\n",
+             temperature_c,
+             humidity_rh);
+    } else {
+      printf("sht30_read failed: %s\n", sht30_strerror(status));
+    }
+    
     /* TODO: Replace with real sensor reads */
-    m.temperature = 22.5f;
-    m.humidity = 45.0f;
-    m.voltage = 3.28f;
+    m.temperature = temperature_c;
+    m.humidity = humidity_rh;
 
     return m;
 }
@@ -504,8 +531,7 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
             "\"time_valid\":%s,"
             "\"uptime_s\":%lu,"
             "\"temperature\":%.2f,"
-            "\"humidity\":%.2f,"
-            "\"voltage\":%.2f"
+            "\"humidity\":%.2f"
             "}",
             (count > 0u) ? "," : "",
             (unsigned long)m->seq,
@@ -513,8 +539,7 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
             m->time_valid ? "true" : "false",
             (unsigned long)m->uptime_s,
             m->temperature,
-            m->humidity,
-            m->voltage
+            m->humidity
         );
 
         if (item_len <= 0 || item_len >= (int)sizeof(item_buf)) {
@@ -1004,9 +1029,10 @@ static void try_send_buffered_measurements(void) {
 
 int main(void) {
     stdio_init_all();
-    sleep_ms(3000);
+    sleep_ms(2000);
     printf("Pico buffered batch HTTP POST example with NTP starting...\n");
 
+    
     if (cyw43_arch_init()) {
         printf("cyw43_arch_init failed\n");
         return 1;
@@ -1015,37 +1041,66 @@ int main(void) {
     cyw43_arch_enable_sta_mode();
     ntp_init_module();
 
-    while (true) {
-        if (ensure_wifi_connected()) {
-            ntp_poll();
+ 
+/*
+     * Initiera sensorn.
+     *
+     * Här använder vi autodetektering av adress:
+     *   0x44 eller 0x45
+     */
+    status = sht30_init(&sensor,
+                            APP_I2C_PORT,
+                            APP_I2C_SDA_PIN,
+                            APP_I2C_SCL_PIN,
+                            APP_I2C_BAUDRATE,
+                            SHT30_ADDR_AUTO);
 
-            if (!ntp_time_is_valid()) {
-                printf("Waiting for initial NTP sync...\n");
-                if (ntp_wait_for_initial_sync(NTP_STARTUP_WAIT_MS)) {
-                    printf("Initial NTP sync OK\n");
-                } else {
-                    printf("Initial NTP sync timeout, continuing with time_valid=false\n");
-                }
-            }
-        } else {
-            printf("Wi-Fi unavailable, will keep buffering measurements\n");
-            sleep_ms(RETRY_DELAY_MS);
+    if (status != SHT30_OK) {
+        printf("sht30_init failed: %s\n", sht30_strerror(status));
+
+        /*
+         * Om init misslyckas stannar vi här så felet blir tydligt.
+         */
+        while (true) {
+            sleep_ms(1000);
         }
-
-        measurement_t m = create_measurement();
-        queue_push(&m);
-
-        printf("Queued measurement seq=%lu time_valid=%s timestamp_utc=%lu (queue depth=%lu)\n",
-               (unsigned long)m.seq,
-               m.time_valid ? "true" : "false",
-               (unsigned long)m.timestamp_utc,
-               (unsigned long)queue_size());
-
-        try_send_buffered_measurements();
-        ntp_poll();
-        sleep_with_housekeeping(SEND_INTERVAL_MS);
     }
 
+    printf("SHT30 initialized successfully at address 0x%02X\n", sensor.addr);
+
+    
+    while (true) {
+      
+      if (ensure_wifi_connected()) {
+        ntp_poll();
+        
+	if (!ntp_time_is_valid()) {
+	  printf("Waiting for initial NTP sync...\n");
+	  if (ntp_wait_for_initial_sync(NTP_STARTUP_WAIT_MS)) {
+	    printf("Initial NTP sync OK\n");
+      } else {
+	    printf("Initial NTP sync timeout, continuing with time_valid=false\n");
+                }
+	}
+      } else {
+        printf("Wi-Fi unavailable, will keep buffering measurements\n");
+        sleep_ms(RETRY_DELAY_MS);
+      }
+      
+      measurement_t m = create_measurement();
+      queue_push(&m);
+      
+      printf("Queued measurement seq=%lu time_valid=%s timestamp_utc=%lu (queue depth=%lu)\n",
+             (unsigned long)m.seq,
+             m.time_valid ? "true" : "false",
+             (unsigned long)m.timestamp_utc,
+             (unsigned long)queue_size());
+      
+      try_send_buffered_measurements();
+      ntp_poll();
+      sleep_with_housekeeping(SEND_INTERVAL_MS);
+    }
+    
     cyw43_arch_deinit();
     return 0;
 }

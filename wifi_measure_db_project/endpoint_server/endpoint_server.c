@@ -117,7 +117,6 @@ static int init_database(void) {
         "uptime_s INTEGER NOT NULL DEFAULT 0,"
         "temperature REAL,"
         "humidity REAL,"
-        "voltage REAL,"
         "UNIQUE(device_id, seq),"
         "FOREIGN KEY(batch_id) REFERENCES batches(id)"
         ");"
@@ -230,15 +229,14 @@ static int insert_measurement_row(
     sqlite3_int64 uptime_s,
     double temperature,
     double humidity,
-    double voltage,
     bool *inserted
 ) {
     const char *sql =
         "INSERT OR IGNORE INTO measurements ("
         "batch_id, server_received_at, device_id, seq, "
         "device_timestamp_utc, time_valid, uptime_s, "
-        "temperature, humidity, voltage"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "temperature, humidity"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
@@ -257,7 +255,7 @@ static int insert_measurement_row(
     sqlite3_bind_int64(stmt, 7, uptime_s);
     sqlite3_bind_double(stmt, 8, temperature);
     sqlite3_bind_double(stmt, 9, humidity);
-    sqlite3_bind_double(stmt, 10, voltage);
+
 
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
@@ -498,8 +496,6 @@ static int ingest_single_measurement_object(
     double humidity =
         json_get_double_or_default(measurement_obj, "humidity", 0.0);
 
-    double voltage =
-        json_get_double_or_default(measurement_obj, "voltage", 0.0);
 
     bool inserted = false;
     if (insert_measurement_row(
@@ -512,7 +508,6 @@ static int ingest_single_measurement_object(
             uptime_s,
             temperature,
             humidity,
-            voltage,
             &inserted
         ) != 0) {
         return -1;
