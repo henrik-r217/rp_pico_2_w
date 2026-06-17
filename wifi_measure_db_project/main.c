@@ -437,7 +437,7 @@ static measurement_t create_measurement(void) {
     m.uptime_s = (uint32_t)(now_ms() / 1000u);
     m.timestamp_utc = ntp_now_utc();
     m.time_valid = ntp_time_is_valid();
-
+    
     status = sht30_read(&sensor, &temperature_c, &humidity_rh);
     if (status == SHT30_OK) {
       DEBUG_print("Temperature: %.2f C, Humidity: %.2f %%RH\n",
@@ -1035,7 +1035,7 @@ int main(void) {
     sleep_ms(2000);
     DEBUG_print("Pico buffered batch HTTP POST example with NTP starting...\n");
 
-    
+    DEBUG_print("%s\n",DEVICE_ID);
     if (cyw43_arch_init()) {
         DEBUG_print("cyw43_arch_init failed\n");
         return 1;
@@ -1065,10 +1065,10 @@ int main(void) {
          * Om init misslyckas stannar vi här så felet blir tydligt.
          */
         while (true) {
-            sleep_ms(1000);
+          sleep_ms(1000);
         }
     }
-
+    
     DEBUG_print("SHT30 initialized successfully at address 0x%02X\n", sensor.addr);
 
     
