@@ -21,6 +21,9 @@ target_include_directories(pico_http_post PRIVATE
 target_compile_definitions(pico_http_post PRIVATE
     WIFI_SSID=\"${WIFI_SSID}\"
     WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
+    DEBUG=\"${DEBUG}\"
+    API_KEY=\"${API_KEY}\"
+    DEVICE_ID=\"${DEVICE_ID}\"
 )
 
 target_link_libraries(pico_http_post

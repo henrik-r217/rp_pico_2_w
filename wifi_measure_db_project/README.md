@@ -1,5 +1,11 @@
 # Raspberry Pi Pico 2 W to C Endpoint Server with SQLite
 
+```    
+cmake -DAPI_KEY="default-dev-key" -DDEVICE_ID="pico-04" -DPICO_BOARD=pico2_w -DPICO_SDK_PATH=~/code_env/pico-sdk -DWIFI_SSID="Telia-9F1ED6" -DWIFI_PASSWORD="aTuptyeMvx89neCd" ..
+```
+
+
+    
 ## Overview
 
 This document describes a complete local-network prototype for sending measurement data from a **Raspberry Pi Pico 2 W** to another device using **HTTP POST**.
