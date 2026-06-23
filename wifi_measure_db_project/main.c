@@ -1,31 +1,43 @@
+/*
+ * main_low_power.c
+ *
+ * Low-power oriented Raspberry Pi Pico W / Pico 2 W telemetry client.
+ *
+ * Purpose:
+ *   - Reduce energy consumption when running from 3x AAA batteries.
+ *   - Measure often, upload less often.
+ *   - Keep Wi-Fi OFF most of the time.
+ *   - Keep the SHT30 sensor powered only during measurement if sensor power switching is available.
+ *   - Keep retry timeouts short to avoid draining batteries when Wi-Fi/server is unavailable.
+ *
+ * Notes:
+ *   - This file keeps the same JSON structure as the MySQL endpoint server:
+ *       device_id, queued_total, dropped_total, time_valid, measurements[]
+ *   - voltage is intentionally NOT included.
+ *   - Replace read_sht30_temperature_humidity() with your real SHT30 driver call.
+ *   - For maximum sleep current reduction on Pico W/Pico 2 W, hardware matters a lot:
+ *       remove/avoid LEDs, use a low-Iq regulator, and optionally power-gate the sensor.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
-#include <time.h>
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
+
+#include "hardware/clocks.h"
 
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
 #include "lwip/dns.h"
 #include "lwip/ip_addr.h"
 #include "lwip/pbuf.h"
+
 #include "sht30.h"
-
-// add debug prints
-#define DEBUG
-
-#ifdef DEBUG
-#define DEBUG_print printf
-#else
-#define DEBUG_print // macros
-
-
-#endif
 
 #ifndef WIFI_SSID
 #define WIFI_SSID "your-ssid"
@@ -38,38 +50,112 @@
 #ifndef API_KEY
 #define API_KEY "default-dev-key"
 #endif
+/*
+ * GPIO device-id support for main_low_power.c
+ *
+ * Wiring for pico-01 with default active-low mapping:
+ *   GPIO13 -> GND  = bit0 = 1
+ *   GPIO14 open    = bit1 = 0
+ *   GPIO15 open    = bit2 = 0
+ * Result: binary 001 -> pico-01
+ */
+#ifndef DEVICE_ID_PREFIX
+#define DEVICE_ID_PREFIX "pico"
+#endif
 
+#define DEVICE_ID_GPIO_BIT0 13
+#define DEVICE_ID_GPIO_BIT1 14
+#define DEVICE_ID_GPIO_BIT2 15
+#define DEVICE_ID_BITS_ACTIVE_LOW 1
+#define DEVICE_ID_STR_LEN 16
+
+static char g_device_id[DEVICE_ID_STR_LEN] = "pico-00";
+
+
+/*
 #ifndef DEVICE_ID
 #define DEVICE_ID "pico-01"
 #endif
+*/
 
+/* =========================================================
+ * Server configuration
+ * ========================================================= */
+
+#ifndef SERVER_HOST
 #define SERVER_HOST "192.168.1.99"
+#endif
+
+#ifndef SERVER_PORT
 #define SERVER_PORT 5000
+#endif
+
+#ifndef SERVER_PATH
 #define SERVER_PATH "/measurements"
+#endif
 
-#define SEND_INTERVAL_MS                 10000u
-#define WIFI_CONNECT_TIMEOUT_MS          30000u
-#define HTTP_TIMEOUT_MS                  10000u
-#define RETRY_DELAY_MS                    5000u
+/* =========================================================
+ * Low-power policy
+ * =========================================================
+ * Recommended battery profile:
+ *   - Measure every 60 seconds.
+ *   - Upload every 10 minutes.
+ *   - Do at most 2 HTTP batch attempts per upload wake.
+ *   - Short Wi-Fi timeout; if unavailable, keep buffering and go back to sleep.
+ */
 
-#define MEASUREMENT_QUEUE_CAPACITY          64u
-#define MAX_BATCH_SIZE                        6u
-#define MAX_BATCH_REQUESTS_PER_CYCLE          4u
-#define PAYLOAD_BUFFER_SIZE                2048u
+#define MEASUREMENT_INTERVAL_MS              (60u * 1000u)
+#define UPLOAD_INTERVAL_MS                   (30u * 60u * 1000u)
+#define NTP_SYNC_INTERVAL_MS                 (5u * 60u * 60u * 1000u)
 
-#define NTP_SERVER                    "pool.ntp.org"
-#define NTP_PORT                      123
-#define NTP_MSG_LEN                   48
-#define NTP_DELTA                     2208988800UL
-#define NTP_RESEND_MS                 10000u
-#define NTP_REFRESH_INTERVAL_MS    3600000u
-#define NTP_STARTUP_WAIT_MS           15000u
+//#define WIFI_CONNECT_TIMEOUT_MS              30000u
+#define WIFI_CONNECT_TIMEOUT_MS              8000u
+#define HTTP_TIMEOUT_MS                      4000u
+#define RETRY_AFTER_WIFI_FAIL_MS             (5u * 60u * 1000u)
+
+#define MEASUREMENT_QUEUE_CAPACITY           128u
+#define MAX_BATCH_SIZE                       32u
+#define MAX_BATCH_REQUESTS_PER_UPLOAD_WAKE   1u
+#define PAYLOAD_BUFFER_SIZE                  2048u
+
+/* Lower CPU clock reduces active current during non-radio work.
+ * Keep 48 MHz as a conservative USB-compatible-ish clock target.
+ */
+//#define LOW_POWER_SYS_CLOCK_KHZ              48000u
+#define LOW_POWER_SYS_CLOCK_KHZ              125000u
+
+/* Set to 1 to keep stdio logs. Set to 0 for production battery operation. */
+#define DEBUG_LOG                            0
+
+/* Optional GPIO to power-gate the SHT30 sensor through a MOSFET/load switch.
+ * Set to -1 if the sensor is always powered.
+ * Example: #define SENSOR_POWER_GPIO 15
+ */
+#define SENSOR_POWER_GPIO                    (-1)
+#define SENSOR_WARMUP_MS                     15u
+
+/* NTP */
+#define NTP_SERVER                           "pool.ntp.org"
+#define NTP_PORT                             123
+#define NTP_MSG_LEN                          48
+#define NTP_DELTA                            2208988800UL
+#define NTP_RESEND_MS                        8000u
 
 #define APP_I2C_PORT     i2c0
 #define APP_I2C_SDA_PIN  4
 #define APP_I2C_SCL_PIN  5
 #define APP_I2C_BAUDRATE 100000
 
+
+#if DEBUG_LOG
+#define LOG_PRINTF(...) printf(__VA_ARGS__)
+#else
+#define LOG_PRINTF(...) do { } while (0)
+#endif
+
+/* =========================================================
+ * Types
+ * ========================================================= */
 
 typedef struct {
     uint32_t seq;
@@ -104,7 +190,9 @@ typedef struct {
     uint64_t request_deadline_ms;
 } ntp_state_t;
 
-static int status;
+/* =========================================================
+ * Globals
+ * ========================================================= */
 static sht30_t sensor;
 static measurement_t measurement_queue[MEASUREMENT_QUEUE_CAPACITY];
 static size_t queue_head = 0;
@@ -114,28 +202,32 @@ static uint32_t next_sequence_number = 1;
 static uint32_t dropped_measurements = 0;
 static ntp_state_t g_ntp;
 
-/* Forward declarations */
-static bool wifi_is_connected(void);
-static bool ensure_wifi_connected(void);
-static uint64_t now_ms(void);
-static void sleep_with_housekeeping(uint32_t total_ms);
+static bool g_wifi_stack_initialized = false;
+static uint64_t g_next_measurement_ms = 0;
+static uint64_t g_next_upload_ms = 0;
+static uint64_t g_next_ntp_sync_ms = 0;
 
-static void ntp_init_module(void);
+/* =========================================================
+ * Forward declarations
+ * ========================================================= */
+
+static uint64_t now_ms(void);
+static bool wifi_stack_on(void);
+static bool wifi_is_connected(void);
+static bool wifi_on_and_connect(void);
+static void wifi_off(void);
+static void low_power_wait_until(uint64_t target_ms);
+
+static void ntp_init_state(void);
+static void ntp_start_if_needed(void);
 static void ntp_poll(void);
 static bool ntp_time_is_valid(void);
 static uint32_t ntp_now_utc(void);
-static bool ntp_wait_for_initial_sync(uint32_t timeout_ms);
 
 static measurement_t create_measurement(void);
 static bool build_batch_payload(char *out, size_t out_size, size_t *batched_count);
-static void try_send_buffered_measurements(void);
 static bool send_one_batch(size_t *sent_count);
-
-static void http_client_reset(http_client_t *client);
-static void http_client_abort(http_client_t *client);
-static void http_client_close(http_client_t *client);
-static void start_http_post(http_client_t *client, const char *payload);
-static bool wait_for_http_completion(http_client_t *client, uint32_t timeout_ms);
+static void try_upload_buffered_measurements(void);
 
 /* =========================================================
  * Utility
@@ -145,14 +237,103 @@ static uint64_t now_ms(void) {
     return (uint64_t)to_ms_since_boot(get_absolute_time());
 }
 
-static void sleep_with_housekeeping(uint32_t total_ms) {
-    uint32_t remaining = total_ms;
-    while (remaining > 0) {
-        uint32_t step = remaining > 100u ? 100u : remaining;
+static void configure_low_power_clock(void) {
+    /* If this ever fails on a specific board/build, comment it out first.
+     * Wi-Fi operations are generally OK at this level, but test your setup.
+     */
+    bool ok = set_sys_clock_khz(LOW_POWER_SYS_CLOCK_KHZ, true);
+    LOG_PRINTF("Clock set to %u kHz: %s\n", LOW_POWER_SYS_CLOCK_KHZ, ok ? "OK" : "FAILED");
+}
+
+static void low_power_wait_until(uint64_t target_ms) {
+    while (now_ms() < target_ms) {
+        uint64_t remaining = target_ms - now_ms();
+        uint32_t step = remaining > 1000u ? 1000u : (uint32_t)remaining;
+
+        /* Safe baseline: sleep_ms.
+         * For even lower power, replace this function with RTC sleep/dormant sleep
+         * after validating wake-up and Wi-Fi reinitialization on your hardware.
+         */
         sleep_ms(step);
-        ntp_poll();
-        remaining -= step;
     }
+}
+static void set_clock_low_power(void) {
+    set_sys_clock_khz(48000, true);
+}
+
+static void set_clock_wifi_mode(void) {
+    set_sys_clock_khz(125000, true);
+}
+
+/* =========================================================
+ * Init GPIO
+ * ========================================================= */
+
+static void device_id_gpio_init(void) {
+    const uint pins[3] = {
+        DEVICE_ID_GPIO_BIT0,
+        DEVICE_ID_GPIO_BIT1,
+        DEVICE_ID_GPIO_BIT2
+    };
+
+    for (size_t i = 0; i < 3; i++) {
+        gpio_init(pins[i]);
+        gpio_set_dir(pins[i], GPIO_IN);
+        gpio_pull_up(pins[i]);
+    }
+
+    sleep_ms(100);
+}
+static uint8_t read_device_id_bits(void) {
+    uint8_t raw0 = gpio_get(DEVICE_ID_GPIO_BIT0) ? 1u : 0u;
+    uint8_t raw1 = gpio_get(DEVICE_ID_GPIO_BIT1) ? 1u : 0u;
+    uint8_t raw2 = gpio_get(DEVICE_ID_GPIO_BIT2) ? 1u : 0u;
+
+#if DEVICE_ID_BITS_ACTIVE_LOW
+    uint8_t b0 = raw0 ? 0u : 1u;
+    uint8_t b1 = raw1 ? 0u : 1u;
+    uint8_t b2 = raw2 ? 0u : 1u;
+#else
+    uint8_t b0 = raw0;
+    uint8_t b1 = raw1;
+    uint8_t b2 = raw2;
+#endif
+
+    return (uint8_t)((b2 << 2u) | (b1 << 1u) | b0);
+}
+
+
+static void build_device_id_from_gpio(char *out, size_t out_len) {
+    uint8_t id = read_device_id_bits();
+    snprintf(out, out_len, "%s-%02u", DEVICE_ID_PREFIX, (unsigned)id);
+}
+
+
+
+
+/* =========================================================
+ * Optional sensor power gating
+ * ========================================================= */
+
+static void sensor_power_init(void) {
+#if SENSOR_POWER_GPIO >= 0
+    gpio_init(SENSOR_POWER_GPIO);
+    gpio_set_dir(SENSOR_POWER_GPIO, GPIO_OUT);
+    gpio_put(SENSOR_POWER_GPIO, 0);
+#endif
+}
+
+static void sensor_power_on(void) {
+#if SENSOR_POWER_GPIO >= 0
+    gpio_put(SENSOR_POWER_GPIO, 1);
+    sleep_ms(SENSOR_WARMUP_MS);
+#endif
+}
+
+static void sensor_power_off(void) {
+#if SENSOR_POWER_GPIO >= 0
+    gpio_put(SENSOR_POWER_GPIO, 0);
+#endif
 }
 
 /* =========================================================
@@ -175,7 +356,6 @@ static measurement_t *queue_get(size_t index_from_head) {
     if (index_from_head >= queue_count) {
         return NULL;
     }
-
     size_t idx = (queue_head + index_from_head) % MEASUREMENT_QUEUE_CAPACITY;
     return &measurement_queue[idx];
 }
@@ -184,7 +364,6 @@ static void queue_pop_one(void) {
     if (queue_is_empty()) {
         return;
     }
-
     queue_head = (queue_head + 1u) % MEASUREMENT_QUEUE_CAPACITY;
     queue_count--;
 }
@@ -201,8 +380,8 @@ static void queue_push(const measurement_t *m) {
         queue_head = (queue_head + 1u) % MEASUREMENT_QUEUE_CAPACITY;
         queue_count--;
         dropped_measurements++;
-        DEBUG_print("Queue full -> dropped oldest measurement (total dropped=%lu)\n",
-               (unsigned long)dropped_measurements);
+        LOG_PRINTF("Queue full -> dropped oldest measurement (total dropped=%lu)\n",
+                   (unsigned long)dropped_measurements);
     }
 
     measurement_queue[queue_tail] = *m;
@@ -211,21 +390,48 @@ static void queue_push(const measurement_t *m) {
 }
 
 /* =========================================================
- * Wi-Fi helpers
+ * Wi-Fi power management
  * ========================================================= */
 
+static bool wifi_stack_on(void) {
+    return g_wifi_stack_initialized;
+}
+
 static bool wifi_is_connected(void) {
+    if (!wifi_stack_on()) {
+        return false;
+    }
     int status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
     return status == CYW43_LINK_UP;
 }
 
-static bool ensure_wifi_connected(void) {
+static bool wifi_on_and_connect(void) {
+    if (!g_wifi_stack_initialized) {
+
+        int rc = cyw43_arch_init();
+        if (rc != 0) {
+            LOG_PRINTF("cyw43_arch_init failed: %d\n", rc);
+
+            /*
+             * KRITISKT:
+             * Säkerställ att vi inte tror att stacken är OK
+             */
+            g_wifi_stack_initialized = false;
+
+            return false;
+        }
+
+        g_wifi_stack_initialized = true;
+        cyw43_arch_enable_sta_mode();
+
+        cyw43_wifi_pm(&cyw43_state, CYW43_AGGRESSIVE_PM);
+    }
+
     if (wifi_is_connected()) {
         return true;
     }
 
-    DEBUG_print("Wi-Fi is down, trying to connect...\n");
-    cyw43_arch_enable_sta_mode();
+    LOG_PRINTF("Connecting to Wi-Fi SSID: %s\n", WIFI_SSID);
 
     int result = cyw43_arch_wifi_connect_timeout_ms(
         WIFI_SSID,
@@ -235,16 +441,63 @@ static bool ensure_wifi_connected(void) {
     );
 
     if (result != 0) {
-        DEBUG_print("Wi-Fi connect failed: %d\n", result);
+        LOG_PRINTF("Wi-Fi connect failed: %d\n", result);
+
+        /*
+         * 🔥 VIKTIGT: resetta stacken vid fel
+         */
+        cyw43_arch_deinit();
+        g_wifi_stack_initialized = false;
+
         return false;
     }
 
-    DEBUG_print("Wi-Fi connected\n");
+    LOG_PRINTF("Wi-Fi connected\n");
     return true;
 }
 
+
+/*
+static void wifi_off(void) {
+    if (!g_wifi_stack_initialized) {
+        return;
+    }
+
+    LOG_PRINTF("Turning Wi-Fi stack off\n");
+    cyw43_arch_deinit();
+    g_wifi_stack_initialized = false;
+
+*/
+
+/* After cyw43_arch_deinit(), any lwIP PCB is gone. Recreate NTP state next time. */
+
+/*  memset(&g_ntp, 0, sizeof(g_ntp));
+}
+*/
+static void wifi_off(void) {
+    if (!g_wifi_stack_initialized) {
+        return;
+    }
+
+    LOG_PRINTF("Turning Wi-Fi stack off (keep time)\n");
+
+    cyw43_arch_deinit();
+    g_wifi_stack_initialized = false;
+
+    /*
+     * ✅ Behåll NTP state:
+     *  - epoch_at_sync
+     *  - ms_at_sync
+     *  - time_valid
+     */
+}
+
+
+
+
+
 /* =========================================================
- * NTP helpers
+ * NTP
  * ========================================================= */
 
 static bool ntp_time_is_valid(void) {
@@ -255,7 +508,6 @@ static uint32_t ntp_now_utc(void) {
     if (!g_ntp.time_valid) {
         return 0;
     }
-
     uint64_t elapsed_ms = now_ms() - g_ntp.ms_at_sync;
     return g_ntp.epoch_at_sync + (uint32_t)(elapsed_ms / 1000u);
 }
@@ -265,40 +517,9 @@ static void ntp_mark_synced(uint32_t epoch_utc) {
     g_ntp.ms_at_sync = now_ms();
     g_ntp.time_valid = true;
     g_ntp.request_in_flight = false;
-    g_ntp.next_sync_ms = now_ms() + NTP_REFRESH_INTERVAL_MS;
-    DEBUG_print("NTP synced: epoch=%lu\n", (unsigned long)epoch_utc);
-}
-
-static void ntp_send_request(void) {
-    if (g_ntp.udp_pcb == NULL) {
-        DEBUG_print("NTP: no UDP PCB\n");
-        return;
-    }
-
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
-    if (!p) {
-        DEBUG_print("NTP: pbuf_alloc failed\n");
-        return;
-    }
-
-    uint8_t *req = (uint8_t *)p->payload;
-    memset(req, 0, NTP_MSG_LEN);
-    req[0] = 0x1b;
-
-    cyw43_arch_lwip_begin();
-    err_t err = udp_sendto(g_ntp.udp_pcb, p, &g_ntp.server_addr, NTP_PORT);
-    cyw43_arch_lwip_end();
-
-    pbuf_free(p);
-
-    if (err != ERR_OK) {
-        DEBUG_print("NTP: udp_sendto failed: %d\n", err);
-        return;
-    }
-
-    g_ntp.request_in_flight = true;
-    g_ntp.request_deadline_ms = now_ms() + NTP_RESEND_MS;
-    DEBUG_print("NTP: request sent\n");
+    g_ntp.next_sync_ms = now_ms() + NTP_SYNC_INTERVAL_MS;
+    g_next_ntp_sync_ms = g_ntp.next_sync_ms;
+    LOG_PRINTF("NTP synced: epoch=%lu\n", (unsigned long)epoch_utc);
 }
 
 static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
@@ -316,18 +537,15 @@ static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
         uint8_t mode = buf[0] & 0x7u;
         uint8_t stratum = buf[1];
-
         if (mode == 0x4u && stratum != 0u) {
             uint32_t seconds_since_1900 =
                 ((uint32_t)buf[40] << 24) |
                 ((uint32_t)buf[41] << 16) |
                 ((uint32_t)buf[42] << 8)  |
                 ((uint32_t)buf[43]);
-
-            uint32_t epoch_utc = seconds_since_1900 - NTP_DELTA;
-            ntp_mark_synced(epoch_utc);
+            ntp_mark_synced(seconds_since_1900 - NTP_DELTA);
         } else {
-            DEBUG_print("NTP: invalid reply (mode=%u stratum=%u)\n", mode, stratum);
+            LOG_PRINTF("NTP invalid reply (mode=%u stratum=%u)\n", mode, stratum);
             g_ntp.request_in_flight = false;
             g_ntp.next_sync_ms = now_ms() + NTP_RESEND_MS;
         }
@@ -336,47 +554,83 @@ static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_free(p);
 }
 
+static void ntp_send_request(void) {
+    if (!wifi_is_connected()) {
+        return;
+    }
+
+    if (!g_ntp.udp_pcb) {
+        cyw43_arch_lwip_begin();
+        g_ntp.udp_pcb = udp_new_ip_type(IPADDR_TYPE_ANY);
+        if (g_ntp.udp_pcb) {
+            udp_recv(g_ntp.udp_pcb, ntp_recv_cb, NULL);
+        }
+        cyw43_arch_lwip_end();
+    }
+
+    if (!g_ntp.udp_pcb) {
+        LOG_PRINTF("NTP: failed to create UDP PCB\n");
+        return;
+    }
+
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
+    if (!p) {
+        LOG_PRINTF("NTP: pbuf_alloc failed\n");
+        return;
+    }
+
+    uint8_t *req = (uint8_t *)p->payload;
+    memset(req, 0, NTP_MSG_LEN);
+    req[0] = 0x1b;
+
+    cyw43_arch_lwip_begin();
+    err_t err = udp_sendto(g_ntp.udp_pcb, p, &g_ntp.server_addr, NTP_PORT);
+    cyw43_arch_lwip_end();
+
+    pbuf_free(p);
+
+    if (err != ERR_OK) {
+        LOG_PRINTF("NTP udp_sendto failed: %d\n", err);
+        return;
+    }
+
+    g_ntp.request_in_flight = true;
+    g_ntp.request_deadline_ms = now_ms() + NTP_RESEND_MS;
+    LOG_PRINTF("NTP request sent\n");
+}
+
 static void ntp_dns_found_cb(const char *hostname, const ip_addr_t *ipaddr, void *arg) {
     (void)hostname;
     (void)arg;
-
     g_ntp.dns_in_progress = false;
 
     if (!ipaddr) {
-        DEBUG_print("NTP: DNS lookup failed\n");
+        LOG_PRINTF("NTP DNS failed\n");
         g_ntp.next_sync_ms = now_ms() + NTP_RESEND_MS;
         return;
     }
 
     g_ntp.server_addr = *ipaddr;
-    DEBUG_print("NTP: server %s\n", ipaddr_ntoa(ipaddr));
     ntp_send_request();
 }
 
-static void ntp_init_module(void) {
+static void ntp_init_state(void) {
     memset(&g_ntp, 0, sizeof(g_ntp));
-
-    cyw43_arch_lwip_begin();
-    g_ntp.udp_pcb = udp_new_ip_type(IPADDR_TYPE_ANY);
-    if (g_ntp.udp_pcb) {
-        udp_recv(g_ntp.udp_pcb, ntp_recv_cb, NULL);
-    }
-    cyw43_arch_lwip_end();
-
-    if (!g_ntp.udp_pcb) {
-        DEBUG_print("NTP: failed to create UDP PCB\n");
-        return;
-    }
-
     g_ntp.next_sync_ms = now_ms();
 }
 
-static void ntp_start_sync(void) {
-    if (g_ntp.dns_in_progress || g_ntp.request_in_flight) {
+static void ntp_start_if_needed(void) {
+    if (!wifi_is_connected()) {
         return;
     }
 
-    DEBUG_print("NTP: resolving %s\n", NTP_SERVER);
+    if (g_ntp.time_valid && now_ms() < g_next_ntp_sync_ms) {
+        return;
+    }
+
+    if (g_ntp.dns_in_progress || g_ntp.request_in_flight) {
+        return;
+    }
 
     cyw43_arch_lwip_begin();
     ip_addr_t tmp_addr;
@@ -385,12 +639,11 @@ static void ntp_start_sync(void) {
 
     if (err == ERR_OK) {
         g_ntp.server_addr = tmp_addr;
-        DEBUG_print("NTP: DNS cached -> %s\n", ipaddr_ntoa(&tmp_addr));
         ntp_send_request();
     } else if (err == ERR_INPROGRESS) {
         g_ntp.dns_in_progress = true;
     } else {
-        DEBUG_print("NTP: dns_gethostbyname failed: %d\n", err);
+        LOG_PRINTF("NTP dns_gethostbyname failed: %d\n", err);
         g_ntp.next_sync_ms = now_ms() + NTP_RESEND_MS;
     }
 }
@@ -401,56 +654,64 @@ static void ntp_poll(void) {
     }
 
     uint64_t ms = now_ms();
-
     if (g_ntp.request_in_flight && ms >= g_ntp.request_deadline_ms) {
-        DEBUG_print("NTP: request timeout, retry later\n");
+        LOG_PRINTF("NTP timeout\n");
         g_ntp.request_in_flight = false;
         g_ntp.next_sync_ms = ms + NTP_RESEND_MS;
     }
-
-    if (!g_ntp.request_in_flight && !g_ntp.dns_in_progress && ms >= g_ntp.next_sync_ms) {
-        ntp_start_sync();
-    }
-}
-
-static bool ntp_wait_for_initial_sync(uint32_t timeout_ms) {
-    uint64_t deadline = now_ms() + timeout_ms;
-
-    while (!ntp_time_is_valid() && now_ms() < deadline) {
-        ntp_poll();
-        sleep_ms(100);
-    }
-
-    return ntp_time_is_valid();
 }
 
 /* =========================================================
- * Measurement generation
+ * Sensor reading
  * ========================================================= */
+
+static bool read_sht30_temperature_humidity(float *temperature, float *humidity) {
+    /* TODO: Replace this stub with real SHT30 I2C reading.
+     * Recommendation for lower power:
+     *   - single-shot mode
+     *   - low repeatability if acceptable
+     *   - no periodic mode
+     *   - power-gate sensor if your board supports it
+     */
+    *temperature = 22.50f;
+    *humidity = 45.00f;
+    return true;
+}
 
 static measurement_t create_measurement(void) {
     measurement_t m;
+    memset(&m, 0, sizeof(m));
     float temperature_c = 0.0f;
     float humidity_rh   = 0.0f;
-
     m.seq = next_sequence_number++;
     m.uptime_s = (uint32_t)(now_ms() / 1000u);
     m.timestamp_utc = ntp_now_utc();
     m.time_valid = ntp_time_is_valid();
-    
-    status = sht30_read(&sensor, &temperature_c, &humidity_rh);
-    if (status == SHT30_OK) {
-      DEBUG_print("Temperature: %.2f C, Humidity: %.2f %%RH\n",
-             temperature_c,
-             humidity_rh);
-    } else {
-      DEBUG_print("sht30_read failed: %s\n", sht30_strerror(status));
-    }
-    
-    /* TODO: Replace with real sensor reads */
-    m.temperature = temperature_c;
-    m.humidity = humidity_rh;
 
+    sensor_power_on();
+    //bool ok = read_sht30_temperature_humidity(&m.temperature, &m.humidity);
+
+    int status = sht30_read(&sensor, &temperature_c, &humidity_rh);
+    if (status == SHT30_OK)
+      {
+        LOG_PRINTF("Temperature: %.2f C, Humidity: %.2f %%RH\n",
+                  temperature_c,
+                    humidity_rh);
+        
+        m.temperature = temperature_c;
+        m.humidity = humidity_rh;
+
+      }
+    else
+      {
+        LOG_PRINTF("sht30_read failed: %s\n", sht30_strerror(status));
+        m.temperature = 0.0f;
+        m.humidity = 0.0f;
+
+      }
+    
+    sensor_power_off();
+    
     return m;
 }
 
@@ -463,7 +724,6 @@ static bool append_to_buffer(char *buf, size_t buf_size, size_t *used, const cha
     if (*used + text_len >= buf_size) {
         return false;
     }
-
     memcpy(buf + *used, text, text_len);
     *used += text_len;
     buf[*used] = '\0';
@@ -476,14 +736,9 @@ static bool append_format(char *buf, size_t buf_size, size_t *used, const char *
     int n = vsnprintf(buf + *used, buf_size - *used, fmt, args);
     va_end(args);
 
-    if (n < 0) {
+    if (n < 0 || (size_t)n >= (buf_size - *used)) {
         return false;
     }
-
-    if ((size_t)n >= (buf_size - *used)) {
-        return false;
-    }
-
     *used += (size_t)n;
     return true;
 }
@@ -503,13 +758,10 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
             "\"dropped_total\":%lu,"
             "\"time_valid\":%s,"
             "\"measurements\":[",
-            DEVICE_ID,
+            g_device_id,
             (unsigned long)queue_size(),
             (unsigned long)dropped_measurements,
             ntp_time_is_valid() ? "true" : "false")) {
-        DEBUG_print("build_batch_payload: failed to write JSON header (used=%lu size=%lu)\n",
-               (unsigned long)used,
-               (unsigned long)out_size);
         return false;
     }
 
@@ -520,11 +772,11 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
 
     for (size_t i = 0; i < max_items; i++) {
         measurement_t *m = queue_get(i);
-        if (m == NULL) {
+        if (!m) {
             break;
         }
 
-        char item_buf[256];
+        char item_buf[224];
         int item_len = snprintf(
             item_buf,
             sizeof(item_buf),
@@ -546,18 +798,11 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
         );
 
         if (item_len <= 0 || item_len >= (int)sizeof(item_buf)) {
-            DEBUG_print("build_batch_payload: measurement format failed for seq=%lu\n",
-                   (unsigned long)m->seq);
             break;
         }
 
-        size_t reserve_tail = 3; /* ]} + nul */
+        size_t reserve_tail = 3;
         if (used + (size_t)item_len + reserve_tail >= out_size) {
-            DEBUG_print("build_batch_payload: stopping at count=%lu, next seq=%lu would exceed buffer (used=%lu size=%lu)\n",
-                   (unsigned long)count,
-                   (unsigned long)m->seq,
-                   (unsigned long)used,
-                   (unsigned long)out_size);
             break;
         }
 
@@ -568,30 +813,19 @@ static bool build_batch_payload(char *out, size_t out_size, size_t *batched_coun
     }
 
     if (count == 0u) {
-        DEBUG_print("build_batch_payload: no measurement fits in payload buffer (size=%lu)\n",
-               (unsigned long)out_size);
         return false;
     }
 
     if (!append_to_buffer(out, out_size, &used, "]}")) {
-        DEBUG_print("build_batch_payload: failed to append JSON trailer (used=%lu size=%lu count=%lu)\n",
-               (unsigned long)used,
-               (unsigned long)out_size,
-               (unsigned long)count);
         return false;
     }
 
     *batched_count = count;
-
-    DEBUG_print("build_batch_payload: built batch with %lu measurements, payload_bytes=%lu\n",
-           (unsigned long)count,
-           (unsigned long)used);
-
     return true;
 }
 
 /* =========================================================
- * HTTP client helpers
+ * HTTP client
  * ========================================================= */
 
 static void http_client_reset(http_client_t *client) {
@@ -599,7 +833,7 @@ static void http_client_reset(http_client_t *client) {
 }
 
 static void http_client_abort(http_client_t *client) {
-    if (client->pcb != NULL) {
+    if (client->pcb) {
         tcp_arg(client->pcb, NULL);
         tcp_sent(client->pcb, NULL);
         tcp_recv(client->pcb, NULL);
@@ -610,12 +844,11 @@ static void http_client_abort(http_client_t *client) {
 }
 
 static void http_client_close(http_client_t *client) {
-    if (client->pcb != NULL) {
+    if (client->pcb) {
         tcp_arg(client->pcb, NULL);
         tcp_sent(client->pcb, NULL);
         tcp_recv(client->pcb, NULL);
         tcp_err(client->pcb, NULL);
-
         err_t err = tcp_close(client->pcb);
         if (err != ERR_OK) {
             tcp_abort(client->pcb);
@@ -638,7 +871,6 @@ static void parse_http_status(http_client_t *client) {
     if (sscanf(client->response_head, "HTTP/%*s %d", &status) == 1) {
         client->http_status = status;
         client->got_http_status = true;
-        DEBUG_print("Parsed HTTP status: %d\n", status);
     }
 }
 
@@ -664,9 +896,8 @@ static void append_response_head(http_client_t *client, const void *data, size_t
 
 static void http_err_cb(void *arg, err_t err) {
     http_client_t *client = (http_client_t *)arg;
-    DEBUG_print("HTTP TCP error: %d\n", err);
-
-    if (client != NULL) {
+    LOG_PRINTF("HTTP TCP error: %d\n", err);
+    if (client) {
         client->pcb = NULL;
         client->complete = true;
         client->success = false;
@@ -675,21 +906,14 @@ static void http_err_cb(void *arg, err_t err) {
 
 static err_t http_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     http_client_t *client = (http_client_t *)arg;
-
-    if (client == NULL) {
-        if (p) {
-            pbuf_free(p);
-        }
+    if (!client) {
+        if (p) pbuf_free(p);
         return ERR_OK;
     }
 
     if (p == NULL) {
         client->complete = true;
-        if (client->got_http_status) {
-            client->success = (client->http_status >= 200 && client->http_status < 300);
-        } else {
-            client->success = false;
-        }
+        client->success = client->got_http_status && client->http_status >= 200 && client->http_status < 300;
         http_client_close(client);
         return ERR_OK;
     }
@@ -701,35 +925,20 @@ static err_t http_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t 
         return err;
     }
 
-    struct pbuf *q = p;
-    while (q != NULL) {
+    for (struct pbuf *q = p; q != NULL; q = q->next) {
         append_response_head(client, q->payload, q->len);
-        fwrite(q->payload, 1, q->len, stdout);
-        q = q->next;
     }
-    DEBUG_print("\n");
 
     tcp_recved(pcb, p->tot_len);
     pbuf_free(p);
     return ERR_OK;
 }
 
-static err_t http_sent_cb(void *arg, struct tcp_pcb *pcb, u16_t len) {
-    (void)arg;
-    (void)pcb;
-    DEBUG_print("HTTP sent %u bytes\n", len);
-    return ERR_OK;
-}
-
 static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     http_client_t *client = (http_client_t *)arg;
-
-    if (client == NULL) {
-        return ERR_ARG;
-    }
+    if (!client) return ERR_ARG;
 
     if (err != ERR_OK) {
-        DEBUG_print("tcp_connect callback error: %d\n", err);
         client->complete = true;
         client->success = false;
         return err;
@@ -756,7 +965,6 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
     );
 
     if (request_len <= 0 || request_len >= (int)sizeof(request)) {
-        DEBUG_print("HTTP request too large\n");
         client->complete = true;
         client->success = false;
         return ERR_BUF;
@@ -764,7 +972,6 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
 
     err_t werr = tcp_write(pcb, request, (u16_t)request_len, TCP_WRITE_FLAG_COPY);
     if (werr != ERR_OK) {
-        DEBUG_print("tcp_write failed: %d\n", werr);
         client->complete = true;
         client->success = false;
         return werr;
@@ -772,39 +979,31 @@ static err_t http_connected_cb(void *arg, struct tcp_pcb *pcb, err_t err) {
 
     err_t oerr = tcp_output(pcb);
     if (oerr != ERR_OK) {
-        DEBUG_print("tcp_output failed: %d\n", oerr);
         client->complete = true;
         client->success = false;
         return oerr;
     }
 
-    DEBUG_print("HTTP POST sent, payload_bytes=%u\n", (unsigned)strlen(client->payload));
     return ERR_OK;
 }
 
 static void http_dns_found_cb(const char *hostname, const ip_addr_t *ipaddr, void *arg) {
     http_client_t *client = (http_client_t *)arg;
+    if (!client) return;
 
-    if (client == NULL) {
-        return;
-    }
-
-    if (ipaddr == NULL) {
-        DEBUG_print("HTTP DNS lookup failed for %s\n", hostname);
+    if (!ipaddr) {
+        LOG_PRINTF("HTTP DNS lookup failed for %s\n", hostname);
         client->complete = true;
         client->success = false;
         return;
     }
 
     client->remote_addr = *ipaddr;
-    DEBUG_print("HTTP DNS resolved %s -> %s\n", hostname, ipaddr_ntoa(ipaddr));
-
     cyw43_arch_lwip_begin();
     err_t err = tcp_connect(client->pcb, &client->remote_addr, SERVER_PORT, http_connected_cb);
     cyw43_arch_lwip_end();
 
     if (err != ERR_OK) {
-        DEBUG_print("tcp_connect failed after DNS: %d\n", err);
         client->complete = true;
         client->success = false;
         http_client_abort(client);
@@ -817,8 +1016,7 @@ static void start_http_post(http_client_t *client, const char *payload) {
     client->payload[sizeof(client->payload) - 1u] = '\0';
 
     client->pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
-    if (client->pcb == NULL) {
-        DEBUG_print("tcp_new_ip_type failed\n");
+    if (!client->pcb) {
         client->complete = true;
         client->success = false;
         return;
@@ -826,7 +1024,6 @@ static void start_http_post(http_client_t *client, const char *payload) {
 
     tcp_arg(client->pcb, client);
     tcp_recv(client->pcb, http_recv_cb);
-    tcp_sent(client->pcb, http_sent_cb);
     tcp_err(client->pcb, http_err_cb);
 
     ip_addr_t addr;
@@ -835,9 +1032,7 @@ static void start_http_post(http_client_t *client, const char *payload) {
         cyw43_arch_lwip_begin();
         err_t err = tcp_connect(client->pcb, &client->remote_addr, SERVER_PORT, http_connected_cb);
         cyw43_arch_lwip_end();
-
         if (err != ERR_OK) {
-            DEBUG_print("tcp_connect failed immediately: %d\n", err);
             client->complete = true;
             client->success = false;
             http_client_abort(client);
@@ -855,15 +1050,11 @@ static void start_http_post(http_client_t *client, const char *payload) {
         err = tcp_connect(client->pcb, &client->remote_addr, SERVER_PORT, http_connected_cb);
         cyw43_arch_lwip_end();
         if (err != ERR_OK) {
-            DEBUG_print("tcp_connect failed after cached DNS: %d\n", err);
             client->complete = true;
             client->success = false;
             http_client_abort(client);
         }
-    } else if (err == ERR_INPROGRESS) {
-        /* Wait for DNS callback */
-    } else {
-        DEBUG_print("dns_gethostbyname failed: %d\n", err);
+    } else if (err != ERR_INPROGRESS) {
         client->complete = true;
         client->success = false;
         http_client_abort(client);
@@ -872,186 +1063,127 @@ static void start_http_post(http_client_t *client, const char *payload) {
 
 static bool wait_for_http_completion(http_client_t *client, uint32_t timeout_ms) {
     uint64_t deadline = now_ms() + timeout_ms;
-
     while (!client->complete && now_ms() < deadline) {
-        sleep_ms(100);
+        sleep_ms(50);
         ntp_poll();
     }
 
     if (!client->complete) {
-        DEBUG_print("HTTP timeout after %lu ms\n", (unsigned long)timeout_ms);
+        LOG_PRINTF("HTTP timeout after %lu ms\n", (unsigned long)timeout_ms);
         http_client_abort(client);
         client->complete = true;
         client->success = false;
-        return false;
     }
 
     return client->success;
 }
 
 /* =========================================================
- * Batch sending
+ * Upload logic
  * ========================================================= */
 
 static bool send_one_batch(size_t *sent_count) {
     *sent_count = 0;
 
     if (queue_is_empty()) {
-        DEBUG_print("send_one_batch: queue is empty\n");
         return true;
-    }
-
-    if (!ensure_wifi_connected()) {
-        DEBUG_print("send_one_batch: cannot send, Wi-Fi unavailable\n");
-        return false;
     }
 
     char payload[PAYLOAD_BUFFER_SIZE];
     size_t batch_count = 0;
-
     if (!build_batch_payload(payload, sizeof(payload), &batch_count)) {
-        DEBUG_print("send_one_batch: failed to build batch payload (queue=%lu, buffer=%u, max_batch=%u)\n",
-               (unsigned long)queue_size(),
-               (unsigned)PAYLOAD_BUFFER_SIZE,
-               (unsigned)MAX_BATCH_SIZE);
+        LOG_PRINTF("Failed to build batch payload\n");
         return false;
     }
-
-    if (batch_count == 0) {
-        DEBUG_print("send_one_batch: batch_count == 0\n");
-        return false;
-    }
-
-    DEBUG_print("send_one_batch: prepared batch with %lu measurements (queue depth before send=%lu)\n",
-           (unsigned long)batch_count,
-           (unsigned long)queue_size());
 
     http_client_t client;
     start_http_post(&client, payload);
     bool ok = wait_for_http_completion(&client, HTTP_TIMEOUT_MS);
 
     if (ok) {
-        DEBUG_print("send_one_batch: POST OK -> removing %lu measurements from queue\n",
-               (unsigned long)batch_count);
         queue_pop_n(batch_count);
         *sent_count = batch_count;
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-        DEBUG_print("send_one_batch: queue depth after send=%lu\n",
-               (unsigned long)queue_size());
+        LOG_PRINTF("POST OK -> removed %lu measurements from queue\n", (unsigned long)batch_count);
         return true;
     }
 
-    DEBUG_print("send_one_batch: POST failed -> keeping %lu measurements in queue\n",
-           (unsigned long)batch_count);
-    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+    LOG_PRINTF("POST failed -> keeping batch in queue\n");
     return false;
 }
 
-static void try_send_buffered_measurements(void) {
-    size_t initial_queue = queue_size();
-    size_t total_sent_this_cycle = 0;
-
-    if (initial_queue == 0) {
-        DEBUG_print("try_send_buffered_measurements: queue empty\n");
+static void try_upload_buffered_measurements(void) {
+    if (queue_is_empty()) {
+        return;
+    }
+    set_clock_wifi_mode();
+    if (!wifi_on_and_connect()) {
+        g_next_upload_ms = now_ms() + RETRY_AFTER_WIFI_FAIL_MS;
+        wifi_off();
+        set_clock_low_power();
         return;
     }
 
-    if (!wifi_is_connected()) {
-        DEBUG_print("try_send_buffered_measurements: Wi-Fi down, skipping send (queued=%lu dropped_total=%lu)\n",
-               (unsigned long)queue_size(),
-               (unsigned long)dropped_measurements);
-        return;
+    ntp_start_if_needed();
+    uint64_t ntp_deadline = now_ms() + 2500u;
+    while (!ntp_time_is_valid() && now_ms() < ntp_deadline) {
+        ntp_poll();
+        sleep_ms(50);
     }
 
-    size_t allowed_batch_attempts = 1;
-
-    if (initial_queue > MAX_BATCH_SIZE * 3u) {
-        allowed_batch_attempts = MAX_BATCH_REQUESTS_PER_CYCLE;
-    } else if (initial_queue > MAX_BATCH_SIZE * 2u) {
-        allowed_batch_attempts = (MAX_BATCH_REQUESTS_PER_CYCLE >= 3u) ? 3u : MAX_BATCH_REQUESTS_PER_CYCLE;
-    } else if (initial_queue > MAX_BATCH_SIZE) {
-        allowed_batch_attempts = (MAX_BATCH_REQUESTS_PER_CYCLE >= 2u) ? 2u : MAX_BATCH_REQUESTS_PER_CYCLE;
-    }
-
-    if (allowed_batch_attempts > MAX_BATCH_REQUESTS_PER_CYCLE) {
-        allowed_batch_attempts = MAX_BATCH_REQUESTS_PER_CYCLE;
-    }
-
-    DEBUG_print("try_send_buffered_measurements: start (queued=%lu, allowed_batch_attempts=%lu)\n",
-           (unsigned long)initial_queue,
-           (unsigned long)allowed_batch_attempts);
-
-    for (size_t batch_no = 0; batch_no < allowed_batch_attempts; batch_no++) {
+    size_t total_sent = 0;
+    for (size_t i = 0; i < MAX_BATCH_REQUESTS_PER_UPLOAD_WAKE; i++) {
         if (queue_is_empty()) {
-            DEBUG_print("try_send_buffered_measurements: queue drained early after %lu batch attempts\n",
-                   (unsigned long)batch_no);
             break;
         }
 
-        size_t before_send = queue_size();
         size_t sent_count = 0;
         bool ok = send_one_batch(&sent_count);
-
-        if (!ok) {
-            DEBUG_print("try_send_buffered_measurements: batch attempt %lu failed (queued=%lu)\n",
-                   (unsigned long)(batch_no + 1u),
-                   (unsigned long)queue_size());
+        if (!ok || sent_count == 0u) {
             break;
         }
-
-        if (sent_count == 0u) {
-            DEBUG_print("try_send_buffered_measurements: batch attempt %lu sent 0 items (stopping)\n",
-                   (unsigned long)(batch_no + 1u));
-            break;
-        }
-
-        total_sent_this_cycle += sent_count;
-
-        DEBUG_print("try_send_buffered_measurements: batch attempt %lu OK (sent=%lu, queue_before=%lu, queue_after=%lu)\n",
-               (unsigned long)(batch_no + 1u),
-               (unsigned long)sent_count,
-               (unsigned long)before_send,
-               (unsigned long)queue_size());
-
-        if (queue_size() <= (MAX_BATCH_SIZE / 2u)) {
-            DEBUG_print("try_send_buffered_measurements: queue now small (%lu), stopping early\n",
-                   (unsigned long)queue_size());
-            break;
-        }
+        total_sent += sent_count;
     }
 
-    DEBUG_print("Cycle result: sent=%lu, queued=%lu, dropped_total=%lu\n",
-           (unsigned long)total_sent_this_cycle,
-           (unsigned long)queue_size(),
-           (unsigned long)dropped_measurements);
+    LOG_PRINTF("Upload result: sent=%lu queued=%lu dropped_total=%lu\n",
+               (unsigned long)total_sent,
+               (unsigned long)queue_size(),
+               (unsigned long)dropped_measurements);
+
+    g_next_upload_ms = now_ms() + UPLOAD_INTERVAL_MS;
+    wifi_off();
+    set_clock_low_power();
 }
 
 /* =========================================================
- * Main
+ * Main low-power scheduler
  * ========================================================= */
 
 int main(void) {
+#if DEBUG_LOG
     stdio_init_all();
-    sleep_ms(2000);
-    DEBUG_print("Pico buffered batch HTTP POST example with NTP starting...\n");
+    sleep_ms(2500);
+#endif
+    device_id_gpio_init();
+    build_device_id_from_gpio(g_device_id, sizeof(g_device_id));
+    LOG_PRINTF("Device ID from GPIO13/14/15: %s\n", g_device_id);
+    
 
-    DEBUG_print("%s\n",DEVICE_ID);
-    if (cyw43_arch_init()) {
-        DEBUG_print("cyw43_arch_init failed\n");
-        return 1;
-    }
+    LOG_PRINTF("Pico low-power telemetry client starting...\n");
 
-    cyw43_arch_enable_sta_mode();
-    ntp_init_module();
+     configure_low_power_clock();
+        sensor_power_init();
+    ntp_init_state();
 
- 
+
+
+    sensor_power_on();
 /*
      * Initiera sensorn.
      *
      * Här använder vi autodetektering av adress:
      *   0x44 eller 0x45
      */
-    status = sht30_init(&sensor,
+  int  status = sht30_init(&sensor,
                             APP_I2C_PORT,
                             APP_I2C_SDA_PIN,
                             APP_I2C_SCL_PIN,
@@ -1059,51 +1191,69 @@ int main(void) {
                             SHT30_ADDR_AUTO);
 
     if (status != SHT30_OK) {
-        DEBUG_print("sht30_init failed: %s\n", sht30_strerror(status));
+        LOG_PRINTF("sht30_init failed: %s\n", sht30_strerror(status));
 
         /*
          * Om init misslyckas stannar vi här så felet blir tydligt.
          */
-        while (true) {
-          sleep_ms(1000);
-        }
+        //        while (true) {
+        //  sleep_ms(1000);
+        // }
     }
     
-    DEBUG_print("SHT30 initialized successfully at address 0x%02X\n", sensor.addr);
+    LOG_PRINTF("SHT30 initialized successfully at address 0x%02X\n", sensor.addr);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     
+    uint64_t start = now_ms();
+    g_next_measurement_ms = start;
+    g_next_upload_ms = start + 5000u;     /* Upload soon after first samples */
+    g_next_ntp_sync_ms = start;           /* Sync on first upload wake */
+
     while (true) {
-      
-      if (ensure_wifi_connected()) {
-        ntp_poll();
-        
-	if (!ntp_time_is_valid()) {
-	  DEBUG_print("Waiting for initial NTP sync...\n");
-	  if (ntp_wait_for_initial_sync(NTP_STARTUP_WAIT_MS)) {
-	    DEBUG_print("Initial NTP sync OK\n");
-      } else {
-	    DEBUG_print("Initial NTP sync timeout, continuing with time_valid=false\n");
-                }
-	}
-      } else {
-        DEBUG_print("Wi-Fi unavailable, will keep buffering measurements\n");
-        sleep_ms(RETRY_DELAY_MS);
-      }
-      
-      measurement_t m = create_measurement();
-      queue_push(&m);
-      
-      DEBUG_print("Queued measurement seq=%lu time_valid=%s timestamp_utc=%lu (queue depth=%lu)\n",
-             (unsigned long)m.seq,
-             m.time_valid ? "true" : "false",
-             (unsigned long)m.timestamp_utc,
-             (unsigned long)queue_size());
-      
-      try_send_buffered_measurements();
-      ntp_poll();
-      sleep_with_housekeeping(SEND_INTERVAL_MS);
+        uint64_t ms = now_ms();
+
+        if (ms >= g_next_measurement_ms) {
+            measurement_t m = create_measurement();
+            queue_push(&m);
+            LOG_PRINTF("Queued seq=%lu time_valid=%s timestamp_utc=%lu temp=%.2f hum=%.2f queue=%lu\n",
+                       (unsigned long)m.seq,
+                       m.time_valid ? "true" : "false",
+                       (unsigned long)m.timestamp_utc,
+                       m.temperature,
+                       m.humidity,
+                       (unsigned long)queue_size());
+
+            g_next_measurement_ms = ms + MEASUREMENT_INTERVAL_MS;
+        }
+
+        /* Upload only at scheduled upload time, or earlier if queue is nearly full. */
+        bool queue_pressure = queue_size() >= (MEASUREMENT_QUEUE_CAPACITY * 3u / 4u);
+        if ((ms >= g_next_upload_ms || queue_pressure) && !queue_is_empty()) {
+            try_upload_buffered_measurements();
+        }
+
+        uint64_t next_event = g_next_measurement_ms;
+        if (!queue_is_empty() && g_next_upload_ms < next_event) {
+            next_event = g_next_upload_ms;
+        }
+
+        low_power_wait_until(next_event);
     }
-    
-    cyw43_arch_deinit();
+
     return 0;
 }
