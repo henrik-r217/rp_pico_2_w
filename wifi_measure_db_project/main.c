@@ -28,8 +28,19 @@
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
-
 #include "hardware/clocks.h"
+
+
+
+//#include "hardware/timer.h"
+
+
+
+//#include "pico/sleep.h"
+#include "hardware/structs/rosc.h"
+#include "hardware/structs/scb.h"
+#include "hardware/structs/clocks.h"
+//#include "hardware/rtc.h"
 
 #include "lwip/tcp.h"
 #include "lwip/udp.h"
@@ -121,11 +132,12 @@ static char g_device_id[DEVICE_ID_STR_LEN] = "pico-00";
 /* Lower CPU clock reduces active current during non-radio work.
  * Keep 48 MHz as a conservative USB-compatible-ish clock target.
  */
-//#define LOW_POWER_SYS_CLOCK_KHZ              48000u
-#define LOW_POWER_SYS_CLOCK_KHZ              125000u
+#define LOW_POWER_SYS_CLOCK_KHZ              48000u
+//#define LOW_POWER_SYS_CLOCK_KHZ              125000u
+#define WIFI_SYS_CLOCK_KHZ                   125000u
 
 /* Set to 1 to keep stdio logs. Set to 0 for production battery operation. */
-#define DEBUG_LOG                            0
+#define DEBUG_LOG                            1
 
 /* Optional GPIO to power-gate the SHT30 sensor through a MOSFET/load switch.
  * Set to -1 if the sensor is always powered.
@@ -244,19 +256,30 @@ static void configure_low_power_clock(void) {
     bool ok = set_sys_clock_khz(LOW_POWER_SYS_CLOCK_KHZ, true);
     LOG_PRINTF("Clock set to %u kHz: %s\n", LOW_POWER_SYS_CLOCK_KHZ, ok ? "OK" : "FAILED");
 }
-
 static void low_power_wait_until(uint64_t target_ms) {
-    while (now_ms() < target_ms) {
-        uint64_t remaining = target_ms - now_ms();
-        uint32_t step = remaining > 1000u ? 1000u : (uint32_t)remaining;
+    while (true) {
+        uint64_t ms = now_ms();
 
-        /* Safe baseline: sleep_ms.
-         * For even lower power, replace this function with RTC sleep/dormant sleep
-         * after validating wake-up and Wi-Fi reinitialization on your hardware.
+        if (ms >= target_ms) {
+            return;
+        }
+
+        uint64_t remaining = target_ms - ms;
+
+        /*
+         * Long sleeps in larger chunks.
+         * This avoids waking every second unnecessarily.
          */
-        sleep_ms(step);
+        if (remaining > 60000u) {
+            sleep_ms(60000u);
+        } else if (remaining > 5000u) {
+            sleep_ms((uint32_t)(remaining - 1000u));
+        } else {
+            sleep_ms((uint32_t)remaining);
+        }
     }
 }
+
 static void set_clock_low_power(void) {
     set_sys_clock_khz(48000, true);
 }
@@ -264,6 +287,17 @@ static void set_clock_low_power(void) {
 static void set_clock_wifi_mode(void) {
     set_sys_clock_khz(125000, true);
 }
+
+
+
+
+
+
+
+
+
+
+
 
 /* =========================================================
  * Init GPIO
@@ -307,6 +341,8 @@ static void build_device_id_from_gpio(char *out, size_t out_len) {
     uint8_t id = read_device_id_bits();
     snprintf(out, out_len, "%s-%02u", DEVICE_ID_PREFIX, (unsigned)id);
 }
+
+
 
 
 
@@ -499,27 +535,31 @@ static void wifi_off(void) {
 /* =========================================================
  * NTP
  * ========================================================= */
-
 static bool ntp_time_is_valid(void) {
     return g_ntp.time_valid;
 }
+
 
 static uint32_t ntp_now_utc(void) {
     if (!g_ntp.time_valid) {
         return 0;
     }
+
     uint64_t elapsed_ms = now_ms() - g_ntp.ms_at_sync;
     return g_ntp.epoch_at_sync + (uint32_t)(elapsed_ms / 1000u);
+
 }
 
 static void ntp_mark_synced(uint32_t epoch_utc) {
-    g_ntp.epoch_at_sync = epoch_utc;
-    g_ntp.ms_at_sync = now_ms();
-    g_ntp.time_valid = true;
-    g_ntp.request_in_flight = false;
-    g_ntp.next_sync_ms = now_ms() + NTP_SYNC_INTERVAL_MS;
-    g_next_ntp_sync_ms = g_ntp.next_sync_ms;
-    LOG_PRINTF("NTP synced: epoch=%lu\n", (unsigned long)epoch_utc);
+  
+  g_ntp.epoch_at_sync = epoch_utc;
+  g_ntp.ms_at_sync = now_ms();
+  g_ntp.time_valid = true;
+  g_ntp.request_in_flight = false;
+  g_ntp.next_sync_ms = now_ms() + NTP_SYNC_INTERVAL_MS;
+  g_next_ntp_sync_ms = g_ntp.next_sync_ms;
+
+  LOG_PRINTF("NTP synced: epoch=%lu\n", (unsigned long)epoch_utc);
 }
 
 static void ntp_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
@@ -1163,18 +1203,16 @@ int main(void) {
     stdio_init_all();
     sleep_ms(2500);
 #endif
+  
+    
     device_id_gpio_init();
     build_device_id_from_gpio(g_device_id, sizeof(g_device_id));
     LOG_PRINTF("Device ID from GPIO13/14/15: %s\n", g_device_id);
-    
-
     LOG_PRINTF("Pico low-power telemetry client starting...\n");
 
-     configure_low_power_clock();
-        sensor_power_init();
+    configure_low_power_clock();
+    sensor_power_init();
     ntp_init_state();
-
-
 
     sensor_power_on();
 /*
